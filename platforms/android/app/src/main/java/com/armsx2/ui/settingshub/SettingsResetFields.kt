@@ -25,10 +25,11 @@ import org.json.JSONObject
 internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = mapOf(
     // PerformanceTab.kt
     SettingsCategory.Performance to listOf(
+        "affinityMode", "autoTune", "dynamicEeCycleRate",
         "eeClampMode", "eeCycleRate", "eeCycleSkip", "eeFpuRoundMode",
         "fastCDVD", "fpsLimit", "frameSkip", "framerateNtsc", "frameratePal",
-        "intcStat", "mtvu", "nominalSpeedPercent", "skipDuplicateFrames", "vu0RoundMode",
-        "vu1ClampMode", "vu1Instant", "vu1RoundMode", "vuClampMode", "vuDeferredWrites",
+        "hwScaler", "intcStat", "iopThread", "iopThreadLag", "mtvu", "vuAot", "nominalSpeedPercent", "screenResOverride", "skipDuplicateFrames", "vu0RoundMode",
+        "vsyncQueueSize", "vu1ClampMode", "vu1Instant", "vu1RoundMode", "vuClampMode", "vuDeferredWrites",
         "vuFlagHack", "vuNeonFusions", "vuSkipStallSim", "waitLoop",
         // LsfgSection lives on this tab. lsfgDllPath is deliberately NOT here: Reset restores
         // settings, and forgetting which file the user imported is not a setting being restored,
@@ -42,8 +43,8 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
         "forceMaliFbFetch", "fsrSharpness", "fxaa", "gpuProfile", "gsBackThreadMode", "hardwareDownloadMode",
         "hwAa1", "hwAccurateAlphaTest", "hwMipmap", "hwRov", "loadTextureReplacements",
         "loadTextureReplacementsAsync", "maxAnisotropy", "orientation",
-        "osdShowTextureReplacements", "portraitRenderTop", "landscapeRenderTop", "autoProgressiveScan",
-        "affinityMode", "precacheTextureReplacements", "renderer",
+        "osdShowTextureReplacements", "portraitRenderTop", "landscapeRenderTop", "vrSideBySide", "vrSize", "vrDistance", "vrHeight", "autoProgressiveScan",
+        "precacheTextureReplacements", "renderer",
         "shadeBoost", "shadeBoostBrightness", "shadeBoostContrast", "shadeBoostGamma",
         "shadeBoostSaturation", "shaderChainEnabled", "shaderChainParams", "shaderChainPreset",
         "textureFiltering", "texturePreloading", "textureUpscale", "triFilter", "tvShader", "upscaleFloat",
@@ -52,8 +53,8 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
     // AudioTab.kt
     SettingsCategory.Audio to listOf(
         "audioBufferMs", "audioFastForwardVolume", "audioMuted", "audioOpenSLES",
-        "audioOutputLatencyMs", "audioSwapChannels", "audioTimeStretch", "audioVolume",
-        "spu2LightweightMix", "spu2NeonReverb",
+        "audioOutputLatencyMs", "audioRecordingCompatible", "audioSwapChannels", "audioTimeStretch",
+        "audioVolume", "spu2LightweightMix", "spu2NeonReverb",
     ),
     // NetworkTab.kt
     SettingsCategory.Network to listOf(
@@ -78,12 +79,12 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
         "gamefixInstantDma", "gamefixOphFlag", "gamefixSkipMpeg",
         "gamefixSoftwareRendererFmv", "gamefixVif1Stall", "gamefixVuAddSub",
         "gamefixVuOverflow", "gamefixVuSync", "gamefixXgkick",
-        "enableFastmem", "recEE", "recIOP", "recVU0", "recVU1",
+        "enableFastmem", "recEE", "recIOP", "recVU0", "recVU1", "extraMemory",
         "alignSprite", "antiBlur", "autoFlush", "autoFlushSw", "bilinearUpscale", "cpuClutRender",
         "cpuFramebufferConversion", "cpuSpriteRenderBw", "cpuSpriteRenderLevel", "cropBottom",
         "cropLeft", "cropRight", "cropTop", "displayZoom", "disableDepthEmulation", "disableFramebufferFetch",
         "disableInterlaceOffset", "disablePartialInvalidation", "disableRenderFixes",
-        "disableSafeFeatures", "disableShaderCache", "disableVertexShaderExpand", "dithering",
+        "disableSafeFeatures", "disableShaderCache", "disableSwapChainPreRotation", "disableVertexShaderExpand", "dithering",
         "drawBuffering", "estimateTextureRegion", "forceEvenSpritePosition",
         "gpuPaletteConversion", "gpuTargetClut", "halfPixelOffset", "hwAccurateAlphaTest",
         "integerScaling", "limit24BitDepth", "manualUserHacks", "mergeSprite", "mipmapSw",
@@ -91,7 +92,7 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
         "roundSprite", "screenOffsets", "showOverscan", "skipDrawEnd", "skipDrawStart",
         "spinCpuReadbacks", "spinGpuReadbacks", "swThreads", "swThreadsHeight",
         "syncToHostRefresh", "textureInsideRt", "textureOffsetX", "textureOffsetY",
-        "unscaledPaletteDraw", "useBlitSwapChain", "vsyncQueueSize",
+        "unscaledPaletteDraw", "useBlitSwapChain",
         // Not a Settings field: the game database entries switched off for this game, which the
         // Fixes tab lists. Resetting the tab turns them back on. Global scope never has it.
         com.armsx2.config.GameDbOverrides.OFF_KEY,
@@ -100,11 +101,19 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
     // Controls keeps its binds and tunables in ControllerMappings and has its own reset row.
 )
 
-/** Default values for just this category's fields, leaving every other tab untouched. */
-internal fun Settings.resetCategory(category: SettingsCategory): Settings {
+/**
+ * Default values for just this category's fields, leaving every other tab untouched. The IOP thread's default is the
+ * device's ([iopThreadDefaultOn], asked only when the category owns that field): on where the performance tier is two or
+ * three cores, which `Settings()` alone cannot say.
+ */
+internal fun Settings.resetCategory(
+    category: SettingsCategory,
+    iopThreadDefaultOn: (mtvu: Boolean) -> Boolean = { com.armsx2.DeviceTier.iopThreadDefault(it) },
+): Settings {
     val fields = SETTINGS_CATEGORY_FIELDS[category] ?: return this
     val current = toJson()
     val defaults = Settings().toJson()
+    if ("iopThread" in fields) defaults.put("iopThread", iopThreadDefaultOn(Settings().cpu.mtvu))
     for (key in fields) {
         if (defaults.has(key)) current.put(key, defaults.get(key)) else current.remove(key)
     }

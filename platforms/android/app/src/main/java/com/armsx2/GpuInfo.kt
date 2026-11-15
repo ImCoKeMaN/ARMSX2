@@ -76,19 +76,22 @@ object GpuInfo {
 
     /**
      * Suggested driver source for [renderer], or null when no custom driver
-     * applies (custom Turnip packs are Adreno-only; Mali/Xclipse/PowerVR run the
-     * built-in system driver). [sourceLabel] matches friendlyDriverSource().
+     * applies (Xclipse and PowerVR run the built-in system driver, and so do Mali parts malisx2
+     * does not support). Adreno maps to a tuned Turnip pack, a supported Mali to malisx2 — the
+     * same sources the driver list offers it ([CustomDriver.sourceLabelsFor]).
      */
     fun recommendation(renderer: String?): Recommendation? {
-        val r = renderer ?: return null
+        val r = CustomDriver.withAdrenoModelNumber(renderer) ?: return null
+        // Our own Mali driver, on exactly the parts malisx2 lists for: the card and the download
+        // list must not disagree about a device that is offered one.
+        if (CustomDriver.isMaliSX2Supported(r)) return Recommendation("ARMSX2 · MaliSX2", "ARMSX2's own Mali driver for this GPU")
         if (!r.contains("Adreno", ignoreCase = true)) return null
         val model = Regex("""(\d{3,4})""").find(r.substringAfter("Adreno", ""))?.value?.toIntOrNull()
         return when {
-            model != null && model >= 800 -> Recommendation("GameHub 8Elite", "Turnip tuned for Snapdragon 8 Elite / Adreno 8xx")
-            model != null && model >= 700 -> Recommendation("Mr Purple", "purple-turnip builds for Adreno 7xx")
-            // The in-pass read fix is trusted on the 650 and up only; below that the pack buys nothing.
-            model != null && model in 650..699 -> Recommendation("ARMSX2 Turnip", "ARMSX2's Turnip with the in-pass read fix for Adreno 650 and up")
-            model != null && model in 600..649 -> Recommendation("KIMCHI", "AdrenoTools Turnip for Adreno 6xx")
+            // StevenMXZ's Turnip gen8 builds, the pick ARMSX3 makes too; the GameHub 8Elite packs stay in the list.
+            model != null && model >= 800 -> Recommendation("StevenMXZ · Adreno-Tools", "Turnip gen8 builds for Snapdragon 8 Elite / Adreno 8xx")
+            // Our own Turnip for all of 6xx and 7xx: the same range the first-run setup offers it on, so the two agree.
+            CustomDriver.isAdreno6xxOr7xx(r) -> Recommendation("ARMSX2 Turnip", "ARMSX2's own Turnip for Adreno 6xx and 7xx")
             else -> Recommendation("KIMCHI", "AdrenoTools Turnip (Adreno)")
         }
     }

@@ -17,6 +17,12 @@
 
 enum class CDVD_SourceType : uint8_t;
 
+namespace IopThread
+{
+	struct PrimeLoad;
+	struct HostCpuInfo;
+}
+
 namespace Threading
 {
 	class ThreadHandle;
@@ -64,7 +70,12 @@ enum class VMBootResult
 	/// The boot failed because the user needs to be prompted to disable
 	/// hardcore mode. If the user agrees, VMManager::Initialize should be
 	/// called again with disable_achievements_hardcore_mode set to true.
-	PromptDisableHardcoreMode
+	PromptDisableHardcoreMode,
+	/// As StartupFailure: no BIOS is configured, or the configured one is
+	/// gone, and the BIOS folder has none to use instead.
+	BIOSNotFound,
+	/// As StartupFailure: the BIOS file was found but cannot be used.
+	BIOSNotUsable,
 };
 
 /// Callback used to restart the VM boot process after the user has consented
@@ -251,6 +262,11 @@ namespace VMManager
 	/// Returns true if the target speed is being synchronized with the host's refresh rate.
 	bool IsTargetSpeedAdjustedToHost();
 
+	/// Returns true when pacing comes from the host's vsync rather than the limiter's
+	/// sleep. Throttle() returns immediately in that case, so there is no frame deadline
+	/// to measure work against.
+	bool IsUsingVSyncForTiming();
+
 	/// Returns the current frame rate of the virtual machine.
 	float GetFrameRate();
 
@@ -262,6 +278,8 @@ namespace VMManager
 
 	/// Runs the virtual machine for the specified number of video frames, and then automatically pauses.
 	void FrameAdvance(u32 num_frames = 1);
+
+	bool IsFrameAdvancing();
 
 	/// Changes the disc in the virtual CD/DVD drive. Passing an empty will remove any current disc.
 	/// Returns false if the new disc can't be opened.
@@ -333,6 +351,30 @@ namespace VMManager
 	{
 		/// Checks settings version. Call once on startup. If it returns false, you should prompt the user to reset.
 		bool CheckSettingsVersion();
+
+		/// Moves a settings file that was written before a default changed to the new default, once. Call on startup,
+		/// after the file has been loaded or defaulted and CheckSettingsVersion() has passed. A file made by
+		/// SetDefaultSettings() is already marked and is left alone. Returns true when it changed the file, which
+		/// includes marking it, so the caller saves it; false when this file was moved before.
+		///
+		/// What it moves, each with a mark of its own in [UI] so one can run without the other:
+		///  - iopThreadLag = 24576, the old default, becomes IopThread::kDefaultSettingLag. A file made while that was
+		///    the default holds it, and a game the game database turns the IOP thread on for runs with the global lag,
+		///    so a stale 24576 would keep costing it. A key the file does not have is not created, since a missing key
+		///    already loads as the new default, and any other lag stays as it is.
+		///  - on a host where the IOP thread now starts on (IopThread::DefaultOnForHost: two or three fast cores, and
+		///    ResolveMode can run it), iopThread = false, or no iopThread key at all, becomes true. The setting was off
+		///    by default before, so both are the stored default. A host with four or more fast cores, or one that cannot
+		///    run the thread, keeps what the file says.
+		/// After a mark is set the user's own choice for that setting stays, turning the thread off again included.
+		///
+		/// This is for frontends that keep the settings in an ini file (Qt, the SDL handheld frontend). The Android app
+		/// keeps its own copy of the settings and moves it itself (ConfigStore.migrateIopThreadLag and
+		/// migrateIopThreadNarrowTier).
+		bool MigrateSettings(SettingsInterface& bsi);
+
+		/// The same for a host the caller describes, so a test can say which device it is.
+		bool MigrateSettings(SettingsInterface& bsi, const IopThread::HostCpuInfo& host);
 
 		/// Loads early settings. Call once on startup.
 		void LoadStartupSettings();
@@ -407,20 +449,57 @@ namespace VMManager
 		/// now, for tools that move the MTGS thread themselves. Returns the mask applied.
 		u64 PlaceGSBackThreadNearGSThread();
 
+		/// Whether the placement the GS back thread would get now, given where the MTGS, EE, VU and IOP threads
+		/// are pinned, includes a processor one of them is pinned to. False when the threads are not pinned (the
+		/// scheduler decides, and there is nothing to say) and on platforms with no placement.
+		bool GSBackThreadWouldShareBusyCore();
+
+		/// Called about twice a second from the GS thread with each emulation thread's share of a processor over the
+		/// last window. While the GS back thread runs and the placement left the threads to the scheduler, the busiest
+		/// thread gets the prime core alone (see the prime core block in VMManager.cpp). A no-op everywhere else.
+		void UpdatePrimeCorePlacement(const IopThread::PrimeLoad& load);
+
+		/// For a host that places the threads itself (pcsx2-gsrunner -gspin / -gsbackpin): the arbiter steps aside.
+		void DisablePrimeCorePlacement();
+
 		/// Returns a list of processors in the system, suitable for pinning for the software renderer.
 		const std::vector<u32>& GetSoftwareRendererProcessorList();
 
-		/// Diagnostic (OSD): where the EE/VU/GS threads are actually running (current core +
-		/// affinity mask) plus the cpuinfo cluster/frequency topology. Used to see whether the
+		/// The performance cores: every processor of at least 0.75 of the fastest one's capacity
+		/// (IopThread::PerformanceMask), one bit per processor number. 0 when the cores cannot be told apart or
+		/// there is no source for it on this platform (everything but Linux and Android).
+		u64 GetPerformanceCoreMask();
+
+		/// How many of them there are.
+		u32 GetPerformanceCoreCount();
+
+		/// Whether this host can run the GS back thread beside the EE, VU1 and GS front threads: at least four performance-tier
+		/// processors (five when the IOP thread is asked for) and a slower tier beside them. False where the cores cannot be
+		/// told apart (no capacity source).
+		bool CanSplitGS();
+
+		/// Diagnostic (OSD): where the EE/VU/GS threads, and the IOP thread while it runs, are actually
+		/// running (current core + affinity mask) plus the cpuinfo cluster/frequency topology. Used to see whether the
 		/// worker threads are being scheduled onto slow cores / clamped by a cpuset.
 		std::string GetThreadPlacementDebug();
 
 		const std::string& GetELFOverride();
 		bool IsExecutionInterrupted();
+		bool IsFrameAdvancing();
+		/// GetState() without the acquire, for the EE event test, which puts an acquire fence after it where it
+		/// relies on the value (see _cpuEventTest_Shared).
+		VMState GetStateForEventTest();
 		void ELFLoadingOnCPUThread(std::string elf_path);
 		void EntryPointCompilingOnCPUThread();
 		void VSyncOnCPUThread();
 		void PollInputOnCPUThread();
+
+#ifdef PCSX2_RECOMPILER_TESTS
+		/// Tests only: set what GetState() reports, without any of SetState()'s side effects.
+		/// The recompiler tests run with no VM, so GetState() reads Shutdown and the EE event
+		/// test returns at its first check; a test of the event test itself sets Running.
+		void SetStateForTests(VMState state);
+#endif
 	} // namespace Internal
 } // namespace VMManager
 

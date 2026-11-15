@@ -23,6 +23,7 @@ target_sources(common PRIVATE
 	MemoryInterface.cpp
 	MemorySettingsInterface.cpp
 	MD5Digest.cpp
+	ModuleMap.cpp
 	PrecompiledHeader.cpp
 	Perf.cpp
 	PmuCounters.cpp
@@ -30,6 +31,7 @@ target_sources(common PRIVATE
 	ReadbackSpinManager.cpp
 	Semaphore.cpp
 	SettingsWrapper.cpp
+	SHA256.cpp
 	SmallString.cpp
 	StringUtil.cpp
 	TextureDecompress.cpp
@@ -66,6 +68,7 @@ target_sources(common PRIVATE
 	MemoryInterface.h
 	MemorySettingsInterface.h
 	MD5Digest.h
+	ModuleMap.h
 	MRCHelpers.h
 	Path.h
 	PmuCounters.h
@@ -77,6 +80,7 @@ target_sources(common PRIVATE
 	ScopedGuard.h
 	SettingsInterface.h
 	SettingsWrapper.h
+	SHA256.h
 	SingleRegisterTypes.h
 	SmallString.h
 	StringUtil.h
@@ -247,6 +251,7 @@ target_link_libraries(common PRIVATE
 	PNG::PNG
 	WebP::libwebp
 	cpuinfo
+	LZMA::LZMA
 )
 
 target_link_libraries(common PUBLIC

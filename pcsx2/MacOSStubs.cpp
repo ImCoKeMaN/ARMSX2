@@ -6,6 +6,7 @@
 #include "Host.h"
 #include "VMManager.h"
 #include "Input/InputManager.h"
+#include "IopThread/OwnerAsserts.h"
 #include "DEV9/pcap_io.h"
 #include "Achievements.h"
 #include "common/HTTPDownloader.h"
@@ -45,12 +46,9 @@ std::optional<std::string> InputManager::ConvertHostKeyboardCodeToString(u32 c) 
 const char* InputManager::ConvertHostKeyboardCodeToIcon(u32 c) { return nullptr; }
 std::optional<u32> InputManager::ConvertHostKeyboardStringToCode(std::string_view s) { return std::nullopt; }
 
-// --- Settings ---
-INISettingsInterface* g_p44_settings_interface = nullptr;
-
 // --- Host functions (declared in Host.h) ---
 bool Host::InNoGUIMode() { return true; }
-void Host::RunOnCPUThread(std::function<void()> f, bool b) { if (f) f(); }
+void Host::RunOnCPUThread(std::function<void()> f, bool b) { BLOCKING_HOST_CALL_ASSERT(b); if (f) f(); }
 void Host::RequestVMShutdown(bool a, bool b, bool c) {}
 bool Host::RequestResetSettings(bool a, bool b, bool c, bool d, bool e) { return false; }
 void Host::CancelGameListRefresh() {}

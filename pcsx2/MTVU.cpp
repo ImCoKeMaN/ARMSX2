@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "EECycleRateSampler.h"
 #include "Gif_Unit.h"
 #include "MTVU.h"
 #include "PerformanceMetrics.h"
@@ -23,8 +24,6 @@ enum MTVU_EVENT
 	MTVU_VU_EXECUTE,     // Execute VU program
 	MTVU_VU_WRITE_MICRO, // Write to VU micro-mem
 	MTVU_VU_WRITE_DATA,  // Write to VU data-mem
-	MTVU_VU_WRITE_VIREGS,// Write to VU registers
-	MTVU_VU_WRITE_VFREGS,// Write to VU registers
 	MTVU_VIF_WRITE_COL,  // Write to Vif col reg
 	MTVU_VIF_WRITE_ROW,  // Write to Vif row reg
 	MTVU_VIF_UNPACK,     // Execute Vif Unpack
@@ -52,13 +51,18 @@ bool SaveStateBase::mtvuFreeze()
 	pxAssert(vu1Thread.IsDone());
 	if (!IsSaving())
 	{
+		// The VU thread is idle here, so set its state directly instead of queueing it.
+		// VU1's micro and data memory are separate entries of the save state
+		// (vu1MicroMem.bin, vu1Memory.bin), read after this function straight into VU1.Micro
+		// and VU1.Mem. Queued copies would hold the memory as it was BEFORE the load, and the
+		// VU thread would write them back over the loaded data whenever it got to the ring.
+		//
+		// The registers were already restored (vuMicroFreeze), the microVU caches were
+		// cleared before the load began (PreLoadPrep), and the VU thread sees all of it once
+		// the next ring write publishes its position with release ordering.
 		vu1Thread.Reset();
-		vu1Thread.WriteCol(vif1);
-		vu1Thread.WriteRow(vif1);
-		vu1Thread.WriteMicroMem(0, VU1.Micro, 0x4000);
-		vu1Thread.WriteDataMem(0, VU1.Mem, 0x4000);
-		vu1Thread.WriteVIRegs(&VU1.VI[0]);
-		vu1Thread.WriteVFRegs(&VU1.VF[0]);
+		vu1Thread.vif.MaskRow = vif1.MaskRow;
+		vu1Thread.vif.MaskCol = vif1.MaskCol;
 	}
 	for (size_t i = 0; i < 4; ++i)
 	{
@@ -174,12 +178,6 @@ void VU_Thread::ExecuteRingBuffer()
 					Read(&VU1.Mem[vu_data_addr], size);
 					break;
 				}
-				case MTVU_VU_WRITE_VIREGS:
-					Read(&VU1.VI, size_u32(32));
-					break;
-				case MTVU_VU_WRITE_VFREGS:
-					Read(&VU1.VF, size_u32(4*32));
-					break;
 				case MTVU_VIF_WRITE_COL:
 					Read(&vif.MaskCol, sizeof(vif.MaskCol));
 					break;
@@ -211,12 +209,17 @@ void VU_Thread::ExecuteRingBuffer()
 
 
 // Should only be called by ReserveSpace()
-__ri void VU_Thread::WaitOnSize(s32 size)
+__ri void VU_Thread::WaitOnSize(s32 size, bool before_wrap)
 {
+	// Hit on every VIF1 push, and almost always answered by one of the two breaks below,
+	// so the clock is not read until the first yield actually happens.
+	u64 wait_begin = 0;
+
 	for (;;)
 	{
 		s32 readPos = GetReadPos();
-		if (readPos <= m_write_pos)
+		// A reader still at 0 hasn't started this lap; once the writer wraps to 0 it would look caught up.
+		if (readPos <= m_write_pos && (readPos != 0 || !before_wrap))
 			break; // MTVU is reading in back of write_pos
 		// FIXME greg: there is a bug somewhere in the queue pointer
 		// management. It creates a deadlock/corruption in SotC intro (before
@@ -226,6 +229,8 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 		if (readPos > m_write_pos + size + _4kb)
 			break; // Enough free front space
 		{          // Let MTVU run to free up buffer space
+			if (wait_begin == 0)
+				wait_begin = EECycleRateSampler::BeginWait();
 			KickStart();
 			// Locking might trigger a full flush of the ring buffer. Yield
 			// will be more aggressive, and only flush the minimal size.
@@ -234,6 +239,9 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 			std::this_thread::yield();
 		}
 	}
+
+	if (wait_begin != 0)
+		EECycleRateSampler::EndVU1Wait(wait_begin);
 }
 
 // Makes sure theres enough room in the ring buffer
@@ -246,7 +254,7 @@ void VU_Thread::ReserveSpace(s32 size)
 
 	if (m_write_pos + size > (buffer_size - 1))
 	{
-		WaitOnSize(1); // Size of MTVU_NULL_PACKET
+		WaitOnSize(1, true); // Size of MTVU_NULL_PACKET
 		Write(MTVU_NULL_PACKET);
 		// Reset local write pointer/position
 		m_write_pos = 0;
@@ -350,13 +358,8 @@ u32 VU_Thread::Get_vuCycles()
 		   2;
 }
 
-void VU_Thread::Get_MTVUChanges()
+void VU_Thread::Apply_MTVUChanges(u32 interrupts)
 {
-	// Note: Atomic communication is with Gif_Unit.cpp Gif_HandlerAD_MTVU
-	u32 interrupts = mtvuInterrupts.load(std::memory_order_relaxed);
-	if (!interrupts)
-		return;
-
 	if (interrupts & InterruptFlagSignal)
 	{
 		std::atomic_thread_fence(std::memory_order_acquire);
@@ -437,7 +440,9 @@ bool VU_Thread::IsDone()
 void VU_Thread::WaitVU()
 {
 	MTVU_LOG("MTVU - WaitVU!");
+	const u64 wait_begin = EECycleRateSampler::BeginWait();
 	semaEvent.WaitForEmpty();
+	EECycleRateSampler::EndVU1Wait(wait_begin);
 }
 
 void VU_Thread::ExecuteVU(u32 vu_addr, u32 vif_top, u32 vif_itop, u32 fbrst)
@@ -500,26 +505,6 @@ void VU_Thread::WriteDataMem(u32 vu_data_addr, const void* data, u32 size)
 	Write(vu_data_addr);
 	Write(size);
 	Write(data, size);
-	CommitWritePos();
-	KickStart();
-}
-
-void VU_Thread::WriteVIRegs(REG_VI* viRegs)
-{
-	MTVU_LOG("MTVU - WriteRegs!");
-	ReserveSpace(1 + size_u32(32));
-	Write(MTVU_VU_WRITE_VIREGS);
-	Write(viRegs, size_u32(32));
-	CommitWritePos();
-	KickStart();
-}
-
-void VU_Thread::WriteVFRegs(VECTOR* vfRegs)
-{
-	MTVU_LOG("MTVU - WriteRegs!");
-	ReserveSpace(1 + size_u32(32*4));
-	Write(MTVU_VU_WRITE_VFREGS);
-	Write(vfRegs, size_u32(32*4));
 	CommitWritePos();
 	KickStart();
 }

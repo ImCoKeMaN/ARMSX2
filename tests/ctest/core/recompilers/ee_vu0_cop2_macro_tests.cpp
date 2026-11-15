@@ -868,6 +868,38 @@ TEST(EeVu0Cop2Macro, VlqiAcrossVu0Vu1AccessBoundaryLoadsVu1Vf)
 	EXPECT_EQ(h.GetVu0ViJit(1), h.GetVu0ViInterp(1));
 }
 
+// The store side of the same path, read back through the window. Macro mode emits mVUaddrFix inline in
+// the EE block, where x29 is the EE's $v0 pin and not VU0's memory pointer, so the window's distance from
+// VU0.Mem is taken from a pointer loaded for the purpose. $v0 is live across the two ops to show it is
+// left alone.
+TEST(EeVu0Cop2Macro, VsqiAcrossVu0Vu1AccessBoundaryStoresVu1Vf)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vi(1, 0x40Cu); // store address: VU1.VF[12]
+	h.SeedVu0Vi(3, 0x40Cu); // load address: the same quadword
+	h.SeedVu0VfBits(2, 0x0BADF00Du, 0x600DCAFEu, 0x13572468u, 0x0F1E2D3Cu);
+	h.SeedVu0VfBits(5, 0x55555555u, 0x55555555u, 0x55555555u, 0x55555555u);
+	// A store that missed the window leaves this for the load to find.
+	h.SeedVu1VfBits(12, 0xAAAAAAAAu, 0xAAAAAAAAu, 0xAAAAAAAAu, 0xAAAAAAAAu);
+	h.SetGpr64(reg::v0, 0x1122334455667788ull);
+	h.LoadProgram({
+		VSQI_C2(mask_xyzw, /*fs*/2, /*it*/1),
+		VLQI_C2(mask_xyzw, /*ft*/5, /*is*/3),
+	});
+	h.Run();
+	EXPECT_EQ(h.GetVu0VfBitsJit(5, 'x'), 0x0BADF00Du);
+	EXPECT_EQ(h.GetVu0VfBitsJit(5, 'y'), 0x600DCAFEu);
+	EXPECT_EQ(h.GetVu0VfBitsJit(5, 'z'), 0x13572468u);
+	EXPECT_EQ(h.GetVu0VfBitsJit(5, 'w'), 0x0F1E2D3Cu);
+	for (char l : {'x', 'y', 'z', 'w'})
+		EXPECT_EQ(h.GetVu0VfBitsJit(5, l), h.GetVu0VfBitsInterp(5, l));
+	EXPECT_EQ(h.GetVu0ViJit(1), 0x40Du);
+	EXPECT_EQ(h.GetVu0ViJit(3), 0x40Du);
+	EXPECT_EQ(h.GetGpr64Jit(reg::v0), 0x1122334455667788ull);
+}
+
 // =========================================================================
 //  COP2 macro-mode VOPMSUB / VOPMULA — outer-product cross math
 // =========================================================================
@@ -2287,6 +2319,58 @@ TEST(EeVu0Cop2Macro, PinnedTier1SurvivesMacroRoutedOps)
 	EXPECT_EQ(h.GetVu0ViJit(3), 6u);
 	for (char l : {'x', 'y', 'z', 'w'})
 		EXPECT_EQ(h.GetVu0VfBitsJit(8, l), h.GetVu0VfBitsInterp(8, l));
+}
+
+// x29 is the EE's $v0 pin and, in micro mode, microVU's pin for the VU's data
+// memory. A live $v0 has to come through every macro-routed memory op, which
+// emit inline in the EE block and must leave x29 alone, and through a VCALLMS
+// whose microprogram addresses VU0 memory off x29 under its own dispatcher,
+// which saves and restores the EE's value. The microprogram stores through a
+// vi00 base (the constant address) and through a live VI, and loads both back.
+TEST(EeVu0Cop2Macro, PinnedV0SurvivesMacroMemoryOpsAndMicroDispatch)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vi(1, 5);  // VSQI address index
+	h.SeedVu0Vi(3, 5);  // VLQI readback index
+	h.SeedVu0Vi(5, 12); // VSQD / VLQD index (pre-decrement)
+	h.SeedVu0Vi(6, 12);
+	h.SeedVu0Vi(7, 30); // VISWR / VILWR address
+	h.SeedVu0Vi(9, 0x1234);
+	h.SeedVu0Vi(10, 40); // microprogram's live base
+	h.SeedVu0VfBits(2, 0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u);
+	h.SeedVu0VfBits(4, 0x40a00000u, 0x40c00000u, 0x40e00000u, 0x41000000u);
+	h.SeedVu0Microprogram(0, {
+		VuOp{vu::VSQ_L(vu::mask::xyzw, /*fs*/4, vu::vi::vi0, 20), vu::VNOP_U()},
+		VuOp{vu::VSQ_L(vu::mask::xyzw, /*fs*/2, vu::vi::vi10, 1), vu::VNOP_U()},
+		VuOp{vu::VLQ_L(vu::mask::xyzw, /*ft*/11, vu::vi::vi0, 20), vu::VNOP_U()},
+		VuOp{vu::VLQ_L(vu::mask::xyzw, /*ft*/12, vu::vi::vi10, 1), vu::VNOP_U()},
+		EBitNopPair(),
+	});
+	h.SetGpr64(reg::t0, 0x1111'2222'3333'4444ull);
+	h.LoadProgram({
+		DADDU(reg::v0, reg::t0, reg::t0),               // $v0 rides x29
+		VSQI_C2(mask_xyzw, /*fs*/2, /*it*/1),
+		VLQI_C2(mask_xyzw, /*ft*/8, /*is*/3),
+		VSQD_C2(mask_xyzw, /*fs*/4, /*it*/5),
+		VLQD_C2(mask_xyzw, /*ft*/9, /*is*/6),
+		VISWR_C2(mask_xyzw, /*it*/9, /*is*/7),
+		VILWR_C2(0x1u << 24, /*it*/8, /*is*/7),
+		VCALLMS(0),
+		DADDU(reg::t1, reg::v0, reg::t0),
+	});
+	h.Run();
+	EXPECT_EQ(h.GetGpr64Jit(reg::v0), 0x2222'4444'6666'8888ull);
+	EXPECT_EQ(h.GetGpr64Jit(reg::t1), 0x3333'6666'9999'CCCCull);
+	for (u32 r : {(u32)reg::v0, (u32)reg::t1})
+		EXPECT_EQ(h.GetGpr64Jit(r), h.GetGpr64Interp(r)) << "GPR " << r;
+	EXPECT_EQ(h.GetVu0ViJit(8), 0x1234u);
+	for (u32 f : {8u, 9u, 11u, 12u})
+		for (char l : {'x', 'y', 'z', 'w'})
+			EXPECT_EQ(h.GetVu0VfBitsJit(f, l), h.GetVu0VfBitsInterp(f, l)) << "vf" << f << "." << l;
+	EXPECT_EQ(h.GetVu0VfBitsJit(11, 'x'), 0x40a00000u);
+	EXPECT_EQ(h.GetVu0VfBitsJit(12, 'w'), 0x40800000u);
 }
 
 // =========================================================================

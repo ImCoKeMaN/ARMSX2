@@ -203,9 +203,16 @@ struct _arm64neonregs
 ////////////////////////////////////////////////////////////////////////////////
 // ARM64 GPR allocator functions
 
-extern _arm64gprregs arm64gprs[NUM_ARM_GPR_REGS], s_saveArm64GPRregs[NUM_ARM_GPR_REGS];
+// The allocator's state is per thread: the EE JIT, the IOP JIT and mVU's COP2 macro mode share this
+// allocator, and with the IOP on its own thread an EE block and an IOP block compile at the same time.
+// A compile clears the maps when it starts and never reads them from another thread, so everything it
+// keeps here is thread_local: the two maps, the copies a branch saves and restores, the liveness info of
+// the instruction being compiled, and the allocation counters (and g_arm64checknext in iCore-arm64.cpp).
+extern thread_local _arm64gprregs arm64gprs[NUM_ARM_GPR_REGS], s_saveArm64GPRregs[NUM_ARM_GPR_REGS];
 
 bool _isAllocatableArm64GPR(int armreg);
+// Bit n set = x_n is in the pool ARM64TYPE_PSX values are allocated from.
+uint32_t _iopAllocatableMask();
 void _initArm64GPRregs();
 int _getFreeArm64GPR(int mode, u32 pool);
 int _allocArm64GPR(int type, int reg, int mode);
@@ -228,7 +235,7 @@ bool mVUIsReservedCOP2(int hostreg);
 ////////////////////////////////////////////////////////////////////////////////
 // ARM64 NEON allocator functions
 
-extern _arm64neonregs arm64neon[NUM_ARM_NEON_REGS], s_saveArm64NEONregs[NUM_ARM_NEON_REGS];
+extern thread_local _arm64neonregs arm64neon[NUM_ARM_NEON_REGS], s_saveArm64NEONregs[NUM_ARM_NEON_REGS];
 
 void _initArm64NEONregs();
 int _getFreeArm64NEON(u32 maxreg = NUM_ARM_NEON_REGS);
@@ -289,7 +296,7 @@ struct EEINST
 	u8 readType[4], readReg[4];
 };
 
-extern EEINST* g_pCurInstInfo;
+extern thread_local EEINST* g_pCurInstInfo;
 extern void _recClearInst(EEINST* pinst);
 extern u32 _recIsRegReadOrWritten(EEINST* pinst, int size, u8 xmmtype, u8 reg);
 extern void _recFillRegister(EEINST& pinst, int type, int reg, int write);
@@ -344,8 +351,8 @@ static __fi bool FPUINST_RENAMETEST(u32 reg)
 	return (!EEINST_USEDTEST(reg) || !EEINST_LIVETEST(reg));
 }
 
-extern u16 g_arm64AllocCounter;
-extern u16 g_neonAllocCounter;
+extern thread_local u16 g_arm64AllocCounter;
+extern thread_local u16 g_neonAllocCounter;
 
 // Allocates only if later instructions use this register
 int _allocIfUsedGPRtoArm64(int gprreg, int mode);
@@ -376,6 +383,12 @@ int _allocIfUsedFPUtoNEON(int fpureg, int mode);
 // memory to be current. Interpreter-call seams must NOT set this: the
 // interpreter writes cpuRegs.GPR, so marks go stale.
 #define FLUSH_CONST_KEEP       0x1000
+
+// Modifier for FLUSH_INTERPRETER: do everything it does EXCEPT store all the
+// lazy-dirty pins. For interpreter seams whose callee reads a known set of
+// guest GPRs and writes none; the call site stores just the pins it needs
+// (armFlushEEPinsForCall) and reloads only the clobbered ones.
+#define FLUSH_KEEP_PINS        0x2000
 
 #define FLUSH_EVERYTHING   0x1ff
 #define FLUSH_INTERPRETER  0xfff

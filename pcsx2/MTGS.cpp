@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "EECycleRateSampler.h"
 #include "GS.h"
 #include "Gif_Unit.h"
 #include "MTGS.h"
@@ -11,10 +12,12 @@
 #include "VMManager.h"
 
 #include "common/FPControl.h"
+#include "common/HostSys.h"
 #include "common/ScopedGuard.h"
 #include "common/StringUtil.h"
 #include "common/WrappedMemCopy.h"
 
+#include <algorithm>
 #include <list>
 #include <mutex>
 #include <thread>
@@ -280,8 +283,51 @@ void MTGS::PostVsyncStart(bool registers_written)
 	s_VsyncSignalListener.store(true, std::memory_order_release);
 	//Console.WriteLn( Color_Blue, "(EEcore Sleep) Vsync\t\tringpos=0x%06x, writepos=0x%06x", m_ReadPos.load(), m_WritePos.load() );
 
+	// The EE thread blocks here for as long as the GS thread is behind. Only this path is timed:
+	// the queue-has-room return above is the frame's normal path and must not read a clock.
+	const u64 wait_begin = EECycleRateSampler::BeginWait();
 	s_sem_Vsync.Wait();
+	EECycleRateSampler::EndGSWait(wait_begin);
 }
+
+/// GS thread only: the last packet it served answered a GS-to-EE read, so it may spin for the next one.
+static bool s_read_fifo_served = false;
+
+namespace
+{
+	/// Whether spinning for the other side of a GS-to-EE read is paying, learnt from what it has
+	/// been doing. A spin is bounded: WorkSema spins up to SPIN_TIME_NS (50 us) in WFE, which the
+	/// architecture timer's event stream ends at most ~100 us later, and then sleeps. One that ran
+	/// out (the answer was a long GPU wait, or both threads share a core so the other could not run)
+	/// counts against spinning, an answer inside the window for it; while the count is negative the
+	/// side sleeps at once and only every 32nd wait spins, to notice when spinning pays again.
+	class ReadSpinLearner
+	{
+	public:
+		bool ShouldSpin()
+		{
+			if (m_score >= 0)
+				return true;
+			if (++m_skipped < 32)
+				return false;
+			m_skipped = 0;
+			return true;
+		}
+
+		void Record(u64 waited_ticks)
+		{
+			const u64 waited_ns = waited_ticks * 1000000000ull / GetTickFrequency();
+			m_score = (waited_ns <= SPIN_TIME_NS) ? std::min(m_score + 1, 8) : std::max(m_score - 2, -8);
+		}
+
+	private:
+		int m_score = 0;
+		u32 m_skipped = 0;
+	};
+
+	ReadSpinLearner s_ee_read_spin; // EE thread
+	ReadSpinLearner s_gs_read_spin; // GS thread
+} // namespace
 
 void MTGS::InitAndReadFIFO(u8* mem, u32 qwc)
 {
@@ -312,7 +358,25 @@ void MTGS::InitAndReadFIFO(u8* mem, u32 qwc)
 	}
 
 	SendPointerPacket(Command::InitAndReadFIFO, qwc, mem);
-	WaitGS(false, false, false);
+
+	// The answer usually comes back within tens of microseconds, and games that read GS memory read it
+	// in bursts (SOCOM II probes 179 positions a frame, The Punisher 18): spin for it before sleeping,
+	// as the GS thread does for the next packet after serving one (s_read_fifo_served). Sleeping on
+	// both sides turned every read into two kernel wake-ups. Bounded and learnt (ReadSpinLearner).
+	SetEvent();
+	const u64 wait_begin = EECycleRateSampler::BeginWait();
+	if (s_ee_read_spin.ShouldSpin())
+	{
+		const u64 spin_begin = GetCPUTicks();
+		if (!s_sem_event.WaitForEmptyWithSpin())
+			pxFailRel("MTGS Thread Died");
+		s_ee_read_spin.Record(GetCPUTicks() - spin_begin);
+	}
+	else if (!s_sem_event.WaitForEmpty())
+	{
+		pxFailRel("MTGS Thread Died");
+	}
+	EECycleRateSampler::EndGSWait(wait_begin);
 }
 
 union PacketTagType
@@ -354,7 +418,20 @@ void MTGS::MainLoop()
 		else
 		{
 			mtvu_lock.unlock();
-			s_sem_event.WaitForWork();
+			// After serving a GS-to-EE read the next request of a burst is usually tens of
+			// microseconds away: spin for it before sleeping (see InitAndReadFIFO).
+			if (s_read_fifo_served && s_gs_read_spin.ShouldSpin())
+			{
+				s_read_fifo_served = false;
+				const u64 spin_begin = GetCPUTicks();
+				s_sem_event.WaitForWorkWithSpin();
+				s_gs_read_spin.Record(GetCPUTicks() - spin_begin);
+			}
+			else
+			{
+				s_read_fifo_served = false;
+				s_sem_event.WaitForWork();
+			}
 			mtvu_lock.lock();
 		}
 
@@ -563,6 +640,7 @@ void MTGS::MainLoop()
 						case Command::InitAndReadFIFO:
 							MTGS_LOG("(MTGS Packet Read) ringtype=Fifo2, size=%d", tag.data[0]);
 							GSInitAndReadFIFO((u8*)tag.pointer, tag.data[0]);
+							s_read_fifo_served = true;
 							break;
 
 						case Command::AsyncReadFIFO:
@@ -654,6 +732,12 @@ void MTGS::WaitGS(bool syncRegs, bool weakWait, bool isMTVU)
 	// we don't want to access the content of the queue
 
 	SetEvent();
+
+	// Both branches block (the MTVU weak wait spins on the ring-busy mutex, the ordinary one
+	// sleeps until the ring drains), so both are timed. BeginWait() returns nothing on the MTVU
+	// thread, which is where the weak wait comes from.
+	const u64 wait_begin = EECycleRateSampler::BeginWait();
+
 	if (weakWait && isMTVU)
 	{
 		// On weakWait we will stop waiting on the MTGS thread if the
@@ -680,6 +764,8 @@ void MTGS::WaitGS(bool syncRegs, bool weakWait, bool isMTVU)
 		if (!s_sem_event.WaitForEmpty())
 			pxFailRel("MTGS Thread Died");
 	}
+
+	EECycleRateSampler::EndGSWait(wait_begin);
 
 	pxAssert(!(weakWait && syncRegs) && "No synchronization for this!");
 
@@ -760,6 +846,10 @@ void MTGS::GenericStall(uint size)
 
 	if (freeroom <= size)
 	{
+		// Both branches below block the EE thread (one sleeps, one spins) and are timed; the fast
+		// return above is not.
+		const u64 wait_begin = EECycleRateSampler::BeginWait();
+
 		// writepos will overlap readpos if we commit the data, so we need to wait until
 		// readpos is out past the end of the future write pos, or until it wraps around
 		// (in which case writepos will be >= readpos).
@@ -820,6 +910,8 @@ void MTGS::GenericStall(uint size)
 					break;
 			}
 		}
+
+		EECycleRateSampler::EndGSWait(wait_begin);
 	}
 }
 

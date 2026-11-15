@@ -27,18 +27,45 @@ struct GSSwPrimRenderState
 	std::unique_ptr<GSTextureCacheSW::Texture> texture[7 + 1];
 	std::unique_ptr<GSVirtualAlignedClass<32>> rasterizer;
 
-	/// One sprite of a palette block copy, validated before any pixel is written.
+	/// One sprite of a palette block copy (or of a 32-bit texel copy), validated before any pixel is written.
 	struct PaletteBlock
 	{
 		GSVector4i rect; ///< pixels written, already scissored
 		s32 u, v; ///< 16.16 texel coordinate at the rect's top-left pixel
 		u32 alpha; ///< the vertex alpha in bits 24-31 when the texture's alpha is not used, else 0
+		int su = 1, sv = 1; ///< texels of the coordinate each pixel steps along each axis; 2 only for a 32-bit texel copy
 	};
 	std::vector<PaletteBlock> palette_blocks;
 
+	/// The palette index of each texel a masked texel copy reads, in the order it writes them.
+	std::vector<u8> texel_scratch;
+
+	/// The covered rectangle of an 8- or 4-bit texture, unswizzled, that GatherIndices() reads the indices from.
+	std::vector<u8> texel_linear;
+
+	/// Per sprite of palette_blocks, where GatherIndices() left its indices: the first row and the distance between
+	/// rows. Either a rectangle of texel_linear (a sprite whose coordinates do not wrap) or rows of texel_scratch.
+	struct TexelRows
+	{
+		const u8* first;
+		int stride;
+	};
+	std::vector<TexelRows> texel_rows;
+
+	/// The covered rectangle of a 32-bit texture, unswizzled, that the 32-bit texel copy reads its rows from.
+	std::vector<u32> texel_linear32;
+
 	/// When false every draw goes through the rasterizer, including the ones the palette block copy
-	/// would take. The copy is exact, so this changes no output; tests use it to run the reference.
+	/// and the masked texel copy would take. The copies are exact, so this changes no output; tests
+	/// use it to run the reference.
 	bool palette_block_copy = true;
+
+	/// The last draw Run() took was drawn by one of the copies rather than the rasterizer, so it marked the
+	/// frame's pages alone and not the depth buffer's. The burst memo replays the marks from it.
+	bool last_draw_copied = false;
+	/// ... and the copy was one of the two block copies (the 32-bit texel copy or the palette block copy), the
+	/// cheapest the road has: the burst memo does not record what they draw (GSRendererHWBurstMemo.cpp).
+	bool last_draw_block_copy = false;
 };
 
 // The rectangle the scanline core walks and the caller accounts for in guest memory. One

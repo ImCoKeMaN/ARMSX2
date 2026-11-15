@@ -339,6 +339,7 @@ bool FullscreenUI::Initialize()
 	s_initialized = true;
 	s_hotkey_list_cache = InputManager::GetHotkeyList();
 	MTGS::SetRunIdle(true);
+	RegisterMemcardRestorePrompt();
 
 	LoadCustomBackground();
 
@@ -460,7 +461,8 @@ void FullscreenUI::OnVMResumed()
 		if (s_current_main_window == MainWindowType::PauseMenu ||
 			s_current_main_window == MainWindowType::Settings ||
 			s_current_main_window == MainWindowType::Achievements ||
-			s_current_main_window == MainWindowType::Leaderboards)
+			s_current_main_window == MainWindowType::Leaderboards ||
+			s_current_main_window == MainWindowType::MemcardBackups)
 		{
 			s_current_main_window = MainWindowType::None;
 			s_current_pause_submenu = PauseSubMenu::None;
@@ -556,6 +558,11 @@ void FullscreenUI::Shutdown(bool clear_state)
 		CancelAllHddOperations();
 		CloseSaveStateSelector();
 		CloseCoverDownloaderWindow();
+		ShutdownAutoCovers();
+		ShutdownDriversPage();
+		ShutdownArcade();
+		ShutdownOnlinePatches();
+		ShutdownTexturePacks();
 		s_cover_image_map.clear();
 		s_game_list_sorted_entries = {};
 		s_last_unsorted_entries = {};
@@ -584,6 +591,7 @@ void FullscreenUI::Shutdown(bool clear_state)
 	s_custom_background_path.clear();
 	s_custom_background_enabled = false;
 
+	ShutdownSavesUI();
 	DestroyResources();
 	ImGuiFullscreen::Shutdown(clear_state);
 	s_initialized = false;
@@ -610,6 +618,8 @@ void FullscreenUI::Render()
 		g_gs_device->Recycle(tex.release());
 	s_cleanup_textures.clear();
 	ImGuiFullscreen::UploadAsyncTextures();
+	PollAutoCovers();
+	PollArcade();
 
 	ImGuiFullscreen::BeginLayout();
 
@@ -665,6 +675,9 @@ void FullscreenUI::Render()
 		case MainWindowType::Leaderboards:
 			Achievements::DrawLeaderboardsWindow();
 			break;
+		case MainWindowType::MemcardBackups:
+			DrawMemcardBackupsWindow();
+			break;
 		default:
 			break;
 	}
@@ -682,6 +695,8 @@ void FullscreenUI::Render()
 
 	if (s_cover_downloader_open)
 		DrawCoverDownloaderWindow();
+
+	DrawOnlinePatchesResults();
 
 	if (s_achievements_login_open || ImGui::IsPopupOpen("RetroAchievements"))
 		DrawAchievementsLoginWindow();
@@ -809,7 +824,7 @@ void FullscreenUI::DestroyResources()
 
 ImGuiFullscreen::FileSelectorFilters FullscreenUI::GetOpenFileFilters()
 {
-	return {"*.bin", "*.iso", "*.cue", "*.mdf", "*.chd", "*.cso", "*.zso", "*.gz", "*.elf", "*.irx", "*.gs", "*.gs.xz", "*.gs.zst", "*.dump"};
+	return {"*.bin", "*.iso", "*.cue", "*.mdf", "*.chd", "*.cso", "*.zso", "*.gz", "*.elf", "*.irx", "*.gs", "*.gs.xz", "*.gs.zst", "*.dump", "*.acgame"};
 }
 
 ImGuiFullscreen::FileSelectorFilters FullscreenUI::GetDiscImageFilters()
@@ -871,6 +886,9 @@ void FullscreenUI::DoVMInitialize(const VMBootParameters& boot_params, bool swit
 
 void FullscreenUI::DoStartPath(const std::string& path, std::optional<s32> state_index, std::optional<bool> fast_boot)
 {
+	if (StartArcadePath(path, state_index, fast_boot))
+		return;
+
 	VMBootParameters params;
 	params.filename = path;
 	params.state_index = state_index;
@@ -1700,10 +1718,11 @@ void FullscreenUI::DrawPauseMenu(MainWindowType type)
 			11, // None
 			4, // Exit
 			3, // Achievements
+			5, // Arcade
 		};
 
 		const bool just_focused = ResetFocusHere();
-		BeginMenuButtons(submenu_item_count[static_cast<u32>(s_current_pause_submenu)], 1.0f, ImGuiFullscreen::LAYOUT_MENU_BUTTON_X_PADDING,
+		BeginMenuButtons(submenu_item_count[static_cast<u32>(s_current_pause_submenu)] + GetArcadePauseMenuItemCount(s_current_pause_submenu), 1.0f, ImGuiFullscreen::LAYOUT_MENU_BUTTON_X_PADDING,
 			ImGuiFullscreen::LAYOUT_MENU_BUTTON_Y_PADDING, ImGuiFullscreen::LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
 
 		if (!ImGui::IsPopupOpen(0u, ImGuiPopupFlags_AnyPopup))
@@ -1733,6 +1752,9 @@ void FullscreenUI::DrawPauseMenu(MainWindowType type)
 					case PauseSubMenu::Achievements:
 						first_id = ImGui::GetID(FSUI_ICONSTR(ICON_PF_BACKWARD, "Back To Pause Menu"));
 						last_id = ImGui::GetID(FSUI_ICONSTR(ICON_FA_STOPWATCH, "Leaderboards"));
+						break;
+					case PauseSubMenu::Arcade:
+						GetArcadePauseWrapIds(&first_id, &last_id);
 						break;
 				}
 
@@ -1778,10 +1800,12 @@ void FullscreenUI::DrawPauseMenu(MainWindowType type)
 						s_current_main_window = MainWindowType::None;
 				}
 
-				if (ActiveButton(FSUI_ICONSTR(ICON_FA_WRENCH, "Game Properties"), false, can_save_state))
+				if (ActiveButton(FSUI_ICONSTR(ICON_FA_WRENCH, "Game Properties"), false, can_save_state || IsArcadeSessionActive()))
 				{
 					SwitchToGameSettings();
 				}
+
+				DrawArcadePauseMenuEntry();
 
 				if (ActiveButton(FSUI_ICONSTR(ICON_FA_TROPHY, "Achievements"), false, Achievements::HasAchievementsOrLeaderboards()))
 				{
@@ -1864,6 +1888,10 @@ void FullscreenUI::DrawPauseMenu(MainWindowType type)
 					OpenLeaderboardsWindow();
 			}
 			break;
+
+			case PauseSubMenu::Arcade:
+				DrawArcadePauseSubMenu(just_focused);
+				break;
 		}
 
 		EndMenuButtons();
@@ -1972,6 +2000,7 @@ u32 FullscreenUI::PopulateSaveStateListEntries(const std::string& title, const s
 		}
 	}
 
+	AppendAutosaveListEntries(serial, crc);
 	return static_cast<u32>(s_save_state_selector_slots.size());
 }
 
@@ -2158,7 +2187,7 @@ void FullscreenUI::DrawSaveStateSelector(bool is_loading)
 						closed = true;
 					}
 
-					if (ActiveButton(FSUI_ICONSTR(ICON_FA_TRASH, "Delete Save"), false, true, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
+					if (ActiveButton(FSUI_ICONSTR(ICON_FA_TRASH, "Delete Save"), false, !IsAutosaveSlot(entry.slot), LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
 					{
 						if (!FileSystem::FileExists(entry.path.c_str()))
 						{
@@ -2448,6 +2477,11 @@ void FullscreenUI::DrawResumeStateSelector()
 void FullscreenUI::DoLoadState(std::string path, std::optional<s32> slot, bool backup)
 {
 	std::string boot_path = s_save_state_selector_game_path;
+
+	// An arcade game has to be prepared before it boots; the state loads once it has.
+	if (!boot_path.empty() && !VMManager::HasValidVM() && StartArcadePath(boot_path, std::nullopt, std::nullopt, path))
+		return;
+
 	Host::RunOnCPUThread([boot_path = std::move(boot_path), path = std::move(path), slot, backup]() {
 		if (VMManager::HasValidVM())
 		{
@@ -3210,6 +3244,8 @@ bool FullscreenUI::ShouldShowSetupWizard()
 void FullscreenUI::SwitchToSetup()
 {
 	s_setup_wizard_step = 0;
+	// Decided once, here: installing the driver must not take its step away under the player.
+	s_setup_offer_driver = ShouldOfferDriverInSetup();
 	s_current_main_window = MainWindowType::Setup;
 	{
 		auto lock = Host::GetSettingsLock();
@@ -3236,22 +3272,57 @@ void FullscreenUI::DrawSetupWindow()
 	// Controller-navigable first-time setup, shown in Big Picture when the desktop
 	// setup wizard was skipped (see QtHost). Steps mirror the essentials the Qt
 	// wizard covers that matter for couch play: BIOS, game directories, achievements.
+	enum class SetupStep : u32
+	{
+		Welcome,
+		BIOS,
+		GameDirectories,
+		Achievements,
+		Performance,
+		Driver,
+		Finished,
+		Count,
+	};
 	static constexpr const char* step_titles[] = {
 		FSUI_NSTR("Welcome"),
 		FSUI_NSTR("BIOS"),
 		FSUI_NSTR("Game Directories"),
 		FSUI_NSTR("RetroAchievements"),
+		FSUI_NSTR("Performance"),
+		FSUI_NSTR("GPU Driver"),
 		FSUI_NSTR("Finished"),
 	};
-	static constexpr u32 STEP_COUNT = std::size(step_titles);
+	static_assert(std::size(step_titles) == static_cast<size_t>(SetupStep::Count));
 
-	const u32 step = std::min(s_setup_wizard_step, STEP_COUNT - 1);
-	const bool last_step = (step == STEP_COUNT - 1);
+	// The GPU Driver step is there only where a driver pack can help (s_setup_offer_driver).
+	SetupStep steps[static_cast<u32>(SetupStep::Count)];
+	u32 step_count = 0;
+	for (u32 i = 0; i < static_cast<u32>(SetupStep::Count); i++)
+	{
+		if (static_cast<SetupStep>(i) != SetupStep::Driver || s_setup_offer_driver)
+			steps[step_count++] = static_cast<SetupStep>(i);
+	}
 
-	const auto go_prev = [&step]() {
-		if (step > 0)
+	const u32 step_index = std::min(s_setup_wizard_step, step_count - 1);
+	const SetupStep step = steps[step_index];
+	const bool last_step = (step_index == step_count - 1);
+
+	// Leaving the driver step while it downloads would leave the pack installed but never selected.
+	const auto driver_step_busy = [step]() {
+		if (step == SetupStep::Driver && IsDriverSetupInstalling())
 		{
-			s_setup_wizard_step = step - 1;
+			ShowToast(ICON_FA_DOWNLOAD, FSUI_STR("Wait for the driver to finish installing, or cancel it."), 4.0f);
+			return true;
+		}
+		return false;
+	};
+
+	const auto go_prev = [step_index, &driver_step_busy]() {
+		if (driver_step_busy())
+			return;
+		if (step_index > 0)
+		{
+			s_setup_wizard_step = step_index - 1;
 			QueueResetFocus(FocusResetType::WindowChanged);
 		}
 		else
@@ -3260,14 +3331,28 @@ void FullscreenUI::DrawSetupWindow()
 			ReturnToMainWindow();
 		}
 	};
-	const auto go_next = [&step, last_step]() {
+	const auto go_next = [step, step_index, last_step, &driver_step_busy]() {
+		if (driver_step_busy())
+			return;
+
+		if (step == SetupStep::Performance)
+		{
+			// Saves the answer even when it was left as it was, so the settings file shows the player was asked.
+			Host::SetBaseBoolSettingValue("EmuCore", "AutoTune", Host::GetBaseBoolSettingValue("EmuCore", "AutoTune", false));
+			Host::CommitBaseSettingChanges();
+		}
+
 		if (last_step)
 		{
+			// A driver pack loads when ARMSX2 starts, so the one installed above is selected now and used after a restart.
+			const bool restart_for_driver = FinishDriverSetup();
 			CompleteSetupWizard();
+			if (restart_for_driver)
+				RestartForDriverSetup();
 		}
 		else
 		{
-			s_setup_wizard_step = step + 1;
+			s_setup_wizard_step = step_index + 1;
 			QueueResetFocus(FocusResetType::WindowChanged);
 		}
 	};
@@ -3285,7 +3370,7 @@ void FullscreenUI::DrawSetupWindow()
 			go_prev();
 
 		NavTitle(SmallString::from_format(FSUI_FSTR("Initial Setup - {} ({}/{})"),
-			Host::TranslateToCString(TR_CONTEXT, step_titles[step]), step + 1, STEP_COUNT));
+			Host::TranslateToCString(TR_CONTEXT, step_titles[static_cast<u32>(step)]), step_index + 1, step_count));
 
 		static constexpr float NAV_ITEM_WIDTH = 25.0f;
 		RightAlignNavButtons(1, NAV_ITEM_WIDTH, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
@@ -3302,7 +3387,7 @@ void FullscreenUI::DrawSetupWindow()
 	if (!BeginFullscreenWindow(
 			ImVec2(0.0f, heading_size.y),
 			ImVec2(io.DisplaySize.x, io.DisplaySize.y - heading_size.y - LayoutScale(LAYOUT_FOOTER_HEIGHT)),
-			TinyString::from_format("setup_content_{}", step).c_str(), UIBackgroundColor, 0.0f,
+			TinyString::from_format("setup_content_{}", static_cast<u32>(step)).c_str(), UIBackgroundColor, 0.0f,
 			ImVec2(ImGuiFullscreen::LAYOUT_MENU_WINDOW_X_PADDING, 0.0f)))
 	{
 		EndFullscreenWindow();
@@ -3327,7 +3412,7 @@ void FullscreenUI::DrawSetupWindow()
 	// Holding it across those calls would deadlock, so scope the lock to the steps that need it.
 	switch (step)
 	{
-		case 0: // Welcome
+		case SetupStep::Welcome:
 		{
 			BeginMenuButtons();
 			MenuHeading(FSUI_CSTR("Welcome to ARMSX2!"));
@@ -3344,14 +3429,14 @@ void FullscreenUI::DrawSetupWindow()
 		}
 		break;
 
-		case 1: // BIOS
+		case SetupStep::BIOS:
 		{
 			auto lock = Host::GetSettingsLock();
 			DrawBIOSSettingsPage();
 		}
 		break;
 
-		case 2: // Game Directories
+		case SetupStep::GameDirectories:
 		{
 			auto lock = Host::GetSettingsLock();
 			BeginMenuButtons();
@@ -3360,20 +3445,43 @@ void FullscreenUI::DrawSetupWindow()
 		}
 		break;
 
-		case 3: // RetroAchievements
+		case SetupStep::Achievements:
 		{
 			auto lock = Host::GetSettingsLock();
 			DrawAchievementsSettingsPage();
 		}
 		break;
 
-		case 4: // Finished
+		case SetupStep::Performance:
+		{
+			auto lock = Host::GetSettingsLock();
+			SettingsInterface* bsi = GetEditingSettingsInterface();
+			BeginMenuButtons();
+			MenuHeading(FSUI_CSTR("Performance"));
+			DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_WAND_MAGIC, "Automatic Performance Tuning"),
+				FSUI_CSTR("When a game can't keep full speed, ARMSX2 tries lighter settings for that game one at a time and keeps the ones "
+						  "that help. You can reset it for any game from the game's settings."),
+				"EmuCore", "AutoTune", false);
+			EndMenuButtons();
+		}
+		break;
+
+		case SetupStep::Driver:
+			DrawDriverSetupStep();
+			break;
+
+		case SetupStep::Finished:
 		default:
 		{
 			BeginMenuButtons();
 			MenuHeading(FSUI_CSTR("Setup Complete!"));
 			ActiveButton(FSUI_CSTR("You're all set. These options can be changed at any time from the Settings menu."), false, false,
 				LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
+			if (IsDriverSetupInstalled())
+			{
+				ActiveButton(FSUI_CSTR("The GPU driver you installed loads when ARMSX2 restarts. ARMSX2 restarts when you finish."), false, false,
+					LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
+			}
 			if (MenuButton(FSUI_ICONSTR(ICON_FA_CHECK, "Finish and Start Playing"),
 					FSUI_CSTR("Completes setup and opens the main menu.")))
 				go_next();
@@ -3463,6 +3571,8 @@ void FullscreenUI::DrawGameListSettingsWindow()
 			FSUI_CSTR("Shows Titles for Games when in Game Grid View Mode"), "UI",
 			"FullscreenUIShowGameGridTitles", true);
 	}
+
+	DrawAutoCoverSettings(bsi);
 
 	MenuHeading(FSUI_CSTR("Operations"));
 	{
@@ -4171,7 +4281,7 @@ void FullscreenUI::ReportStateLoadError(const std::string& message, std::optiona
 		}
 
 		std::string title;
-		if (slot.has_value())
+		if (slot.has_value() && *slot > 0)
 		{
 			if (backup)
 				title = fmt::format(FSUI_FSTR("Failed to Load State From Backup Slot {}"), *slot);
@@ -4247,6 +4357,7 @@ TRANSLATE_NOOP("FullscreenUI", "Failed to delete save state.");
 TRANSLATE_NOOP("FullscreenUI", "Scanning for new games...");
 TRANSLATE_NOOP("FullscreenUI", "empty title");
 TRANSLATE_NOOP("FullscreenUI", "no serial");
+TRANSLATE_NOOP("FullscreenUI", "Wait for the driver to finish installing, or cancel it.");
 TRANSLATE_NOOP("FullscreenUI", "Failed to copy text to clipboard.");
 TRANSLATE_NOOP("FullscreenUI", "Download Failed");
 TRANSLATE_NOOP("FullscreenUI", "This game has no achievements.");
@@ -4288,8 +4399,11 @@ TRANSLATE_NOOP("FullscreenUI", "Welcome to ARMSX2!");
 TRANSLATE_NOOP("FullscreenUI", "Navigate with the D-Pad, and use the shoulder buttons to move between steps.");
 TRANSLATE_NOOP("FullscreenUI", "Choose a BIOS, add your game directories, and optionally sign in to RetroAchievements.");
 TRANSLATE_NOOP("FullscreenUI", "Go straight to the main menu. You can configure everything later from Settings.");
+TRANSLATE_NOOP("FullscreenUI", "Performance");
+TRANSLATE_NOOP("FullscreenUI", "When a game can't keep full speed, ARMSX2 tries lighter settings for that game one at a time and keeps the ones that help. You can reset it for any game from the game's settings.");
 TRANSLATE_NOOP("FullscreenUI", "Setup Complete!");
 TRANSLATE_NOOP("FullscreenUI", "You're all set. These options can be changed at any time from the Settings menu.");
+TRANSLATE_NOOP("FullscreenUI", "The GPU driver you installed loads when ARMSX2 restarts. ARMSX2 restarts when you finish.");
 TRANSLATE_NOOP("FullscreenUI", "Completes setup and opens the main menu.");
 TRANSLATE_NOOP("FullscreenUI", "Game List Settings");
 TRANSLATE_NOOP("FullscreenUI", "List Settings");
@@ -4337,6 +4451,7 @@ TRANSLATE_NOOP("FullscreenUI", "Welcome");
 TRANSLATE_NOOP("FullscreenUI", "BIOS");
 TRANSLATE_NOOP("FullscreenUI", "Game Directories");
 TRANSLATE_NOOP("FullscreenUI", "RetroAchievements");
+TRANSLATE_NOOP("FullscreenUI", "GPU Driver");
 TRANSLATE_NOOP("FullscreenUI", "Finished");
 TRANSLATE_NOOP("FullscreenUI", "Type");
 TRANSLATE_NOOP("FullscreenUI", "Serial");
@@ -4399,6 +4514,7 @@ TRANSLATE_NOOP("FullscreenUI", "Enable Subdirectory Scanning");
 TRANSLATE_NOOP("FullscreenUI", "Remove From List");
 TRANSLATE_NOOP("FullscreenUI", "Set Up ARMSX2");
 TRANSLATE_NOOP("FullscreenUI", "Skip Setup and Start Playing");
+TRANSLATE_NOOP("FullscreenUI", "Automatic Performance Tuning");
 TRANSLATE_NOOP("FullscreenUI", "Finish and Start Playing");
 TRANSLATE_NOOP("FullscreenUI", "Default View");
 TRANSLATE_NOOP("FullscreenUI", "Sort By");

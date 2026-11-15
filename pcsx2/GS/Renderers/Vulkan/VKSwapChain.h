@@ -52,7 +52,8 @@ public:
 	// Destroys a previously-created surface.
 	static void DestroyVulkanSurface(VkInstance instance, WindowInfo* wi, VkSurfaceKHR surface);
 
-	// Create a new swap chain from a pre-existing surface.
+	// Create a new swap chain from a pre-existing surface. The swap chain owns the surface from here on,
+	// and destroys it if creation fails, so the caller must not destroy it after this call.
 	static std::unique_ptr<VKSwapChain> Create(const WindowInfo& wi, VkSurfaceKHR surface, VkPresentModeKHR present_mode,
 		std::optional<bool> exclusive_fullscreen_control);
 
@@ -63,9 +64,22 @@ public:
 	__fi VkSwapchainKHR GetSwapChain() const { return m_swap_chain; }
 	__fi const VkSwapchainKHR* GetSwapChainPtr() const { return &m_swap_chain; }
 	__fi const WindowInfo& GetWindowInfo() const { return m_window_info; }
+	/// Window size in the orientation the window is laid out in. Layout code uses this.
 	__fi u32 GetWidth() const { return m_window_info.surface_width; }
 	__fi u32 GetHeight() const { return m_window_info.surface_height; }
 	__fi float GetScale() const { return m_window_info.surface_scale; }
+
+	/// Rotation the swap chain images are created with (their preTransform). When the surface
+	/// reports a rotation, the images are rendered pre-rotated so the presentation engine does not
+	/// have to rotate them: on Android that rotation is what forces SurfaceFlinger to compose the
+	/// game layer on the GPU. Rot90/Rot270 images have the window's width and height swapped.
+	__fi DisplayRotation GetPreRotation() const { return m_pre_rotation; }
+	__fi u32 GetImageWidth() const { return m_image_width; }
+	__fi u32 GetImageHeight() const { return m_image_height; }
+
+	/// Whether the surface now asks for a different rotation than the swap chain was created with.
+	/// Only meaningful after a VK_SUBOPTIMAL_KHR; it queries the surface.
+	bool HasSurfaceRotationChanged() const;
 	__fi u32 GetCurrentImageIndex() const { return m_current_image; }
 	__fi const u32* GetCurrentImageIndexPtr() const { return &m_current_image; }
 	__fi u32 GetImageCount() const { return static_cast<u32>(m_images.size()); }
@@ -102,6 +116,12 @@ public:
 	/// already using one of those, so this is imageCount - minImageCount. Frame generation must
 	/// not acquire more than this: doing so is undefined behaviour, not a recoverable error.
 	__fi u32 GetExtraAcquirableImages() const { return m_extra_acquirable_images; }
+
+	/// Whether this swap chain asked for frame generation's extra images when it was built
+	/// (GSConfig.LsfgEnabled was on then). When it did and still has none to spare, the driver
+	/// gave all it will, and rebuilding it again would not help.
+	__fi bool IsSizedForFrameGeneration() const { return m_sized_for_frame_generation; }
+
 	VkResult AcquireNextImage();
 	void ReleaseCurrentImage();
 	void ResetImageAcquireResult();
@@ -112,11 +132,18 @@ public:
 	// Change vsync enabled state. This may fail as it causes a swapchain recreation.
 	bool SetPresentMode(VkPresentModeKHR present_mode);
 
+	/// Rebuild at the current size with this present mode, even when the mode is unchanged (so the
+	/// image count is chosen afresh). Same contract as ResizeSwapChain: no command buffer that is
+	/// recording or in flight may reference the swap chain, so wait for the GPU first and never
+	/// call this between acquiring an image and submitting the present.
+	bool RebuildSwapChain(VkPresentModeKHR present_mode);
+
 private:
 	VKSwapChain(const WindowInfo& wi, VkSurfaceKHR surface, VkPresentModeKHR present_mode,
 		std::optional<bool> exclusive_fullscreen_control);
 
 	static std::optional<VkSurfaceFormatKHR> SelectSurfaceFormat(VkSurfaceKHR surface);
+	static bool SurfaceListsNoFormats(VkSurfaceKHR surface);
 
 	bool CreateSwapChain();
 	void DestroySwapChain();
@@ -137,12 +164,18 @@ private:
 
 	std::vector<std::unique_ptr<GSTextureVK>> m_images;
 	u32 m_extra_acquirable_images = 0;
+	bool m_sized_for_frame_generation = false;
 	std::array<ImageSemaphores, NUM_SEMAPHORES> m_semaphores = {};
 
 	u32 m_current_image = 0;
 	u32 m_current_semaphore = 0;
 
 	VkPresentModeKHR m_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+	DisplayRotation m_surface_rotation = DisplayRotation::Rot0; // what the surface asked for at creation
+	DisplayRotation m_pre_rotation = DisplayRotation::Rot0; // what the images were created with
+	u32 m_image_width = 0;
+	u32 m_image_height = 0;
 
 	std::optional<VkResult> m_image_acquire_result;
 	std::optional<bool> m_exclusive_fullscreen_control;

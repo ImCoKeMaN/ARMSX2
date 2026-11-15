@@ -187,6 +187,12 @@ enum class SpeedHack
 	InstantVU1,
 	MTVU,
 	EECycleRate,
+	IOPThread,
+	// The dynamic EE cycle-rate governor. It is in this enum for its bit in
+	// PerGameOverrides::speedhacks, which records that the player wrote the key in the
+	// per-game file (an opt-in the governor must obey). Not a game database key:
+	// gamedb-schema.json's speedHacks object is closed (additionalProperties false).
+	DynamicEECycleRate,
 	MaxCount,
 };
 
@@ -497,8 +503,7 @@ enum class GSUpscaler : u8
 
 /// Generates larger copies of game textures on the CPU, in the background, and feeds them to the
 /// renderer the way a texture pack would. Persisted as an integer under the INI key
-/// TextureUpscale (the first key was TextureUpscaleMode, whose values meant something else, so
-/// it is not read); append, never renumber.
+/// TextureUpscale; append, never renumber.
 enum class GSTextureUpscaleMode : u8
 {
 	Off,
@@ -735,6 +740,9 @@ struct TraceLogFilters
 //
 struct Pcsx2Config
 {
+	// Hosts with less RAM than this keep the smaller GIF path 2/3 buffers.
+	static constexpr u64 LOW_MEMORY_HOST_BYTES = 2ull << 30;
+
 	struct ProfilerOptions
 	{
 		BITFIELD32()
@@ -793,10 +801,25 @@ struct Pcsx2Config
 
 		// Cache compiled VU micro-programs to disk and reload them across
 		// sessions to cut recompilation stutter on later runs. arm64-only;
-		// no-op on x86.
+		// no-op on x86. Read through UseVUProgramCache(), not directly: the
+		// cache is also on whenever EnableVUAot is.
 		bool
 			EnableVUProgramCache : 1;
+
+		// vu-aot, the whole-program VU1 compiler (pcsx2/arm64/vuaot/): programs
+		// that run often enough are recompiled above microVU, which stays the
+		// fallback at every block boundary. arm64-only; no-op on x86. Default
+		// on. It turns the VU program cache on (UseVUProgramCache()), which
+		// keeps the compiled code on disk for the next session.
+		bool
+			EnableVUAot : 1;
 		BITFIELD_END
+
+		// Whether the on-disk VU program cache runs: EnableVUProgramCache, or EnableVUAot
+		// (vu-aot is bound to the cache; there is no separate switch). Read the cache
+		// setting through this. Both bits are CPU options, so changing either resets the
+		// VU recompilers (VMManager::CheckForCPUConfigChanges), which re-reads this.
+		bool UseVUProgramCache() const { return EnableVUProgramCache || EnableVUAot; }
 
 		RecompilerOptions();
 		void ApplySanityCheck();
@@ -892,9 +915,15 @@ struct Pcsx2Config
 					ExtendedUpscalingMultipliers : 1,
 					PCRTCAntiBlur : 1,
 					DisableInterlaceOffset : 1,
+					// Automatic deinterlacing runs the comb pass (shader mode 4) while a movie plays in
+					// frame mode (see SelectGSInterlaceMode). Off by default; frontends opt in.
+					MovieCombDeinterlace : 1,
 					PCRTCOffsets : 1,
 					PCRTCOverscan : 1,
 					IntegerScaling : 1,
+					// Crop one native pixel off every edge of the displayed frame when the hardware
+					// renderer is upscaling 2x or more; the outermost row/column is often garbage there.
+					TrimUpscaledEdges : 1,
 					UseDebugDevice : 1,
 					UseDebugBlend : 1,
 					// Emit per-draw graphics-debugger labels describing the PS2 state.
@@ -905,6 +934,10 @@ struct Pcsx2Config
 					// not free, so never leave it on for one arm of an A/B.
 					DumpDrawLog : 1,
 					UseBlitSwapChain : 1,
+					// Create the swap chain in the window's orientation and leave the screen's rotation
+					// to the compositor, as before pre-rotation. For surfaces that report a rotation
+					// they do not undo (issue #890).
+					DisableSwapChainPreRotation : 1,
 					DisableShaderCache : 1,
 					// Record the TFX pipelines each game uses and build them on worker threads
 					// when the game starts, ahead of their first draw. Needs the shader cache.
@@ -961,6 +994,9 @@ struct Pcsx2Config
 					UserHacks_MergePPSprite : 1,
 					UserHacks_ForceEvenSpritePosition : 1,
 					UserHacks_NativePaletteDraw : 1,
+					// Draw a +-1 counter draw on the colclip path (shadow volumes counted by colour
+					// wrap-around) at the target's native resolution. See GSRendererHW::IsColClipCounterDraw().
+					UserHacks_NativeCounterDraws : 1,
 					UserHacks_EstimateTextureRegion : 1,
 					UserHacks_DrawBuffering : 1,
 					UserHacks_RewriteLargeSTCoords : 1,
@@ -1387,17 +1423,45 @@ struct Pcsx2Config
 			WaitLoop : 1, // enables constant loop detection and fast-forwarding
 			vuFlagHack : 1, // microVU specific flag hack
 			vuThread : 1, // Enable Threaded VU1
-			vu1Instant : 1; // Enable Instant VU1 (Without MTVU only)
+			vu1Instant : 1, // Enable Instant VU1 (Without MTVU only)
+			// JIT code tests vuThread by its bit position in this word (microVU-arm64.cpp), so the
+			// flags below stay after every older one.
+			iopThread : 1, // Run the IOP on its own thread (IopThread::ResolveMode decides whether it can)
+			iopThreadLockstep : 1, // With iopThread: strict turns with the EE instead of concurrent. Testing only, no UI.
+			// Let the governor lower the EE cycle rate below EECycleRate, by up to two
+			// steps, when the host cannot hold the frame deadline. Never above it, and
+			// never written back — EECycleRate stays the player's baseline.
+			DynamicEECycleRate : 1,
+			// With iopThread: EE-started SIF0/SIF1 DMA does not hold the IOP. The EE posts the pump as an item stamped
+			// with its cycle, and the IOP runs it when its own clock reaches the stamp (IopThread::DeferSifPump). INI
+			// only, no UI, experimental. After DynamicEECycleRate so that no existing bit moves.
+			iopThreadDeferSif : 1;
 		BITFIELD_END
 
 		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)
 		u8 EECycleSkip; // EE Cycle skip factor (0, 1, 2, or 3)
+
+		// The IOP thread's lag bound L, in EE cycles. Clamped by IopThread::ClampLag when it is read
+		// from the settings file. An advanced setting: INI only, never in a simple settings view.
+		int iopThreadLag;
+
+		// Development trace for the governor: one CSV row per sampling window, written
+		// to this path. Empty means no trace.
+		//
+		// ⚠️ Deliberately outside operator==: CheckForCPUConfigChanges() must not see it,
+		// or turning the trace on mid-session would discard the EE and microVU code caches.
+		std::string DynamicEECycleRateTrace;
 
 		SpeedhackOptions();
 		void LoadSave(SettingsWrapper& conf);
 		SpeedhackOptions& DisableAll();
 
 		void Set(SpeedHack id, int value);
+
+		/// RetroAchievements hardcore mode. Overclocking stays allowed; underclocking
+		/// does not, because it slows the game down and makes it easier. That rules out
+		/// cycle skip and the dynamic governor, which underclocks on its own.
+		void ClampForHardcoreMode();
 
 		bool operator==(const SpeedhackOptions& right) const;
 		bool operator!=(const SpeedhackOptions& right) const;
@@ -1627,18 +1691,26 @@ struct Pcsx2Config
 		EnableFastBoot : 1,
 		EnableFastBootFastForward : 1,
 		EnableThreadPinning : 1,
+		EnablePrimeCorePlacement : 1, // GS multi-threading on a part with one prime core: the busiest thread gets it alone
 		// TODO - Vaser - where are these settings exposed in the Qt UI?
 		EnableRecordingTools : 1,
 		EnableGameFixes : 1, // enables automatic game fixes
 		SaveStateOnShutdown : 1, // default value for saving state on shutdown
+		AutosaveOnShutdown : 1, // also write a rotating autosave when the game is closed
 		EnableDiscordPresence : 1, // enables discord rich presence integration
 		UseSavestateSelector : 1,
 		InhibitScreensaver : 1,
 		BackupSavestate : 1,
+		McdAutoBackup : 1, // [MemoryCards] AutoBackup: snapshot the memory cards at boot
 		ManuallySetRealTimeClock : 1, // passes user-set real-time clock information to cdvd at startup
 		UseSystemLocaleFormat : 1, // presents OS time format instead of yyyy-MM-dd HH:mm:ss for manual RTC
 
 		HostFs : 1,
+
+		// Auto-tune (pcsx2/AutoTune): tries one slowdown countermeasure at a time and keeps what helped.
+		// Kept out of Cpu/Speedhacks on purpose: those are compared in CheckForCPUConfigChanges, and
+		// flipping this switch must not flush the recompiler caches.
+		AutoTune : 1,
 
 		WarnAboutUnsafeSettings : 1;
 	BITFIELD_END
@@ -1668,8 +1740,12 @@ struct Pcsx2Config
 	// slots (3 each)
 	McdOptions Mcd[8];
 	std::string GzipIsoIndexTemplate; // for quick-access index with gzipped ISO
+	std::string AutoTuneTrace; // developer only: CSV path, one row per auto-tune window; empty = off
 
 	int PINESlot;
+
+	int AutosaveIntervalMinutes; // 0 = off
+	int AutosaveKeep; // 1-5
 
 	int RtcYear;
 	int RtcMonth;
@@ -1687,6 +1763,18 @@ struct Pcsx2Config
 	// Fall back aspect ratio for games that have patches (when AspectRatioType::RAuto4_3_3_2) is active.
 	float CurrentCustomAspectRatio = 0.f;
 	bool IsPortableMode = false;
+
+	// Where the resolved EE cycle rate came from; the resolved integer cannot say. The same
+	// -1 can be the global default, a game database entry, or a key the player wrote for
+	// this game, and only the first is not a compatibility claim. The dynamic governor may
+	// only move a rate nobody claimed.
+	//
+	// Re-derived on every settings apply; never loaded, saved or copied. It is left out of
+	// CopyRuntimeConfig() on purpose, since ApplySettings() rebuilds the config and a copy
+	// would be stale.
+	bool GameDBSetEECycleRate = false;
+	bool PerGameClaimsEECycleRate = false;
+	bool PerGameClaimsDynamicEECycleRate = false;
 
 	Pcsx2Config();
 	void LoadSave(SettingsWrapper& wrap);

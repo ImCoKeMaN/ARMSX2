@@ -58,9 +58,12 @@
 
 #include "pcsx2/Achievements.h"
 #include "pcsx2/CDVD/CDVDcommon.h"
+#include "pcsx2/Catalog/DriverPacks.h"
 #include "pcsx2/GS.h"
+#include "pcsx2/GS/Renderers/Common/GSHeadlessPresent.h"
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
+#include "pcsx2/IopThread/OwnerAsserts.h"
 #include "pcsx2/INISettingsInterface.h"
 #include "pcsx2/ImGui/FullscreenUI.h"
 #include "pcsx2/ImGui/ImGuiFullscreen.h"
@@ -70,6 +73,9 @@
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/SIO/Pad/Pad.h"
 #include "pcsx2/VMManager.h"
+#ifdef ENABLE_OPENGL
+#include "pcsx2/GS/Renderers/OpenGL/GLContext.h"
+#endif
 
 #include "svnrev.h"
 
@@ -96,6 +102,15 @@ static std::atomic<bool> s_shutdown_requested{false};
 static u32 s_requested_width = 0;
 static u32 s_requested_height = 0;
 
+// --headless WxH: no display and no SDL video. The GS gets a Surfaceless window of this size and
+// presents into an offscreen texture (GSHeadlessPresent.h); PINE's UIScreenshot reads it back.
+static bool s_headless = false;
+static u32 s_headless_width = 0;
+static u32 s_headless_height = 0;
+
+// -bigpicture: with no ISO, start in Big Picture even if UI/StartBigPictureMode was turned off.
+static bool s_force_bigpicture = false;
+
 // Wayland fallback window. Created lazily by BuildWindowInfo() the first time a
 // render window is requested, but only when running under a Wayland compositor
 // (WAYLAND_DISPLAY set) — on a bare kmsdrm handheld this stays null and the
@@ -118,12 +133,30 @@ static std::condition_variable s_cpu_queue_cv;
 // being called from the CPU thread itself (which would self-deadlock).
 static std::atomic<std::thread::id> s_cpu_thread_id{};
 
-// Background game-list scanner. FullscreenUI's GameList page calls
-// Host::RefreshGameListAsync, which spawns a single worker thread to
-// GameList::Refresh. The thread is joined (blocking) at shutdown and at
-// restart, to avoid two scans racing.
+// Background game-list scanner. The CPU thread starts one at launch, and Big
+// Picture's refresh buttons start more from the GS thread through
+// Host::RefreshGameListAsync.
+//
+// GameList::Refresh holds the CDVD lock for the whole scan, and
+// VMManager::Initialize fails if it cannot take that lock, so no scan may be
+// running when a game boots. Initialize calls Host::CancelGameListRefresh
+// first: that sets s_gamelist_cancel, which the scan polls between files, and
+// waits for the thread to end. It also blocks new scans until
+// Host::OnVMDestroyed, because the VM holds the lock from then on.
+//
+// RefreshGameListAsync never waits for the scan thread. Big Picture calls it
+// with the GameList lock held and the scan thread needs that lock to add
+// entries, so a wait there would deadlock. A request made during a scan
+// cancels it, and the scan thread runs the new one when it has ended.
+static std::mutex s_gamelist_lock; // guards everything below except s_gamelist_cancel
+static std::condition_variable s_gamelist_idle_cv;
 static std::thread s_gamelist_thread;
-static std::atomic<bool> s_gamelist_running{false};
+static bool s_gamelist_scanning = false; // the scan thread has not finished
+static bool s_gamelist_rescan = false; // a request arrived during the scan
+static bool s_gamelist_rescan_invalidate = false;
+static bool s_gamelist_blocked = false; // a game is booting or running, or we are exiting
+static bool s_gamelist_rescan_after_vm = false; // a scan was cut short or refused while blocked
+static std::atomic<bool> s_gamelist_cancel{false};
 
 //////////////////////////////////////////////////////////////////////////
 // Settings + lifecycle
@@ -179,6 +212,10 @@ bool Pcsx2SDL::InitializeConfig()
 		VMManager::SetDefaultSettings(*s_base_settings, true, true, true, true, true);
 	}
 
+	// A file from before a default changed is moved to the new default once; the Save below writes it. A file just
+	// made by SetDefaultSettings() is already marked.
+	VMManager::Internal::MigrateSettings(*s_base_settings);
+
 	// Secrets layer (achievements credentials etc). Created on first run;
 	// failure to create is non-fatal — just log and continue.
 	const std::string secrets_path = Path::Combine(EmuFolders::Settings, "secrets.ini");
@@ -229,6 +266,8 @@ bool Pcsx2SDL::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 			std::fprintf(stderr, "Usage: %s [options] <iso-path>\n\n", argv[0]);
 			std::fprintf(stderr, "  --fullscreen-mode WxH    Request a specific display mode\n");
 			std::fprintf(stderr, "                           (default: monitor's preferred mode)\n");
+			std::fprintf(stderr, "  --headless WxH           No display: render to an offscreen WxH image (for PINE UIScreenshot)\n");
+			std::fprintf(stderr, "  -bigpicture              Start in Big Picture when no disc is given\n");
 			std::fprintf(stderr, "  --bios-only              Boot the BIOS without loading a disc\n");
 			std::fprintf(stderr, "  --state-from-file PATH   Resume from a save state file\n");
 			std::fprintf(stderr, "  --no-fast-boot           Skip fast boot (run full BIOS animation)\n");
@@ -259,6 +298,25 @@ bool Pcsx2SDL::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 			}
 			continue;
 		}
+		if (ARG_PARAM("--headless"))
+		{
+			const char* mode = argv[++i];
+			const char* x_pos = std::strchr(mode, 'x');
+			s_headless_width = x_pos ? StringUtil::FromChars<u32>(std::string_view(mode, x_pos - mode)).value_or(0) : 0;
+			s_headless_height = x_pos ? StringUtil::FromChars<u32>(x_pos + 1).value_or(0) : 0;
+			if (s_headless_width < 64 || s_headless_height < 64 || s_headless_width > 8192 || s_headless_height > 8192)
+			{
+				std::fprintf(stderr, "Invalid --headless '%s', expected WxH between 64x64 and 8192x8192 (e.g. 1280x720).\n", mode);
+				return false;
+			}
+			s_headless = true;
+			continue;
+		}
+		if (ARG("-bigpicture"))
+		{
+			s_force_bigpicture = true;
+			continue;
+		}
 		if (ARG("--bios-only"))
 		{
 			params.source_type = CDVD_SourceType::NoDisc;
@@ -276,9 +334,8 @@ bool Pcsx2SDL::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 		}
 		if (argv[i][0] == '-')
 		{
-			// Note for anyone arriving from the Qt frontend: this one takes none of its
-			// flags - no -fullscreen, -bigpicture, -nogui, -batch or -fastboot. Fullscreen
-			// is always on, and with no ISO it starts in the Big Picture game-picker.
+			// Of the Qt frontend's flags only -bigpicture is taken (no -fullscreen, -nogui, -batch
+			// or -fastboot): fullscreen is always on, and with no ISO it starts in Big Picture.
 			std::fprintf(stderr, "Unknown argument: '%s'\nRun with --help for the accepted options.\n", argv[i]);
 			return false;
 		}
@@ -408,6 +465,20 @@ static bool BuildWaylandWindowInfo(WindowInfo& wi)
 
 std::optional<WindowInfo> Pcsx2SDL::BuildWindowInfo()
 {
+	if (s_headless)
+	{
+		// Surfaceless: the GS draws every present into an offscreen texture of this size instead
+		// of a swapchain image, so there is no SDL video, compositor or DRM master. The refresh
+		// rate only paces the no-game idle present.
+		WindowInfo wi;
+		wi.type = WindowInfo::Type::Surfaceless;
+		wi.surface_width = s_headless_width;
+		wi.surface_height = s_headless_height;
+		wi.surface_scale = 1.0f;
+		wi.surface_refresh_rate = GSHeadless::kFrameRate;
+		return wi;
+	}
+
 #if defined(WAYLAND_API)
 	if (WaylandSessionPresent())
 	{
@@ -565,6 +636,17 @@ void Host::OnVMStarted()
 
 void Host::OnVMDestroyed()
 {
+	// The CDVD lock is free again. Redo a scan that the game start cut short, so Big Picture does not come back to a
+	// partial list.
+	bool rescan;
+	{
+		std::lock_guard<std::mutex> lock(s_gamelist_lock);
+		s_gamelist_blocked = false;
+		rescan = std::exchange(s_gamelist_rescan_after_vm, false);
+	}
+
+	if (rescan && !s_shutdown_requested.load(std::memory_order_acquire))
+		Host::RefreshGameListAsync(false);
 }
 
 void Host::OnVMPaused()
@@ -625,6 +707,7 @@ void Host::PumpMessagesOnCPUThread()
 
 void Host::RunOnCPUThread(std::function<void()> function, bool block)
 {
+	BLOCKING_HOST_CALL_ASSERT(block);
 	if (block)
 	{
 		// Inline if already on the CPU thread to avoid self-deadlock.
@@ -660,26 +743,103 @@ void Host::RunOnCPUThread(std::function<void()> function, bool block)
 	s_cpu_queue_cv.notify_all();
 }
 
+namespace
+{
+	// GameList::Refresh and FileSystem::FindFiles poll IsCancelled(). Nothing reads the progress.
+	class GameListScanProgress final : public BaseProgressCallback
+	{
+	public:
+		bool IsCancelled() const override { return s_gamelist_cancel.load(std::memory_order_acquire); }
+
+		void SetTitle(const char* title) override {}
+
+		void DisplayError(const char* message) override { Console.Error("%s", message); }
+		void DisplayWarning(const char* message) override { Console.Warning("%s", message); }
+		void DisplayInformation(const char* message) override { Console.WriteLn("%s", message); }
+		void DisplayDebugMessage(const char* message) override { DevCon.WriteLn("%s", message); }
+
+		void ModalError(const char* message) override { Console.Error("%s", message); }
+		bool ModalConfirmation(const char* message) override
+		{
+			Console.WriteLn("%s", message);
+			return false;
+		}
+		void ModalInformation(const char* message) override { Console.WriteLn("%s", message); }
+	};
+} // namespace
+
+static void GameListScanThreadMain(bool invalidate_cache)
+{
+	Threading::SetNameOfCurrentThread("GameList Refresh");
+
+	GameListScanProgress progress;
+	for (;;)
+	{
+		GameList::Refresh(invalidate_cache, false, &progress);
+
+		std::lock_guard<std::mutex> lock(s_gamelist_lock);
+		if (!s_gamelist_rescan)
+		{
+			s_gamelist_scanning = false;
+			s_gamelist_idle_cv.notify_all();
+			return;
+		}
+
+		invalidate_cache = s_gamelist_rescan_invalidate;
+		s_gamelist_rescan = false;
+		s_gamelist_rescan_invalidate = false;
+		s_gamelist_cancel.store(false, std::memory_order_release);
+	}
+}
+
+// Cancels the running scan, drops any queued one, and waits for the thread to end. That takes as long as the scan
+// needs to finish the file it is on. Scans stay blocked afterwards: the caller is a game boot (the VM then holds the
+// CDVD lock until Host::OnVMDestroyed) or the frontend exiting.
 void Pcsx2SDL::StopGameListRefreshThread()
 {
-	if (!s_gamelist_thread.joinable())
-		return;
-	s_gamelist_thread.join();
+	std::unique_lock<std::mutex> lock(s_gamelist_lock);
+
+	s_gamelist_blocked = true;
+	s_gamelist_rescan = false;
+	s_gamelist_rescan_invalidate = false;
+	if (s_gamelist_scanning)
+	{
+		// The list is left partial: Host::OnVMDestroyed redoes the scan, which is incremental through the cache.
+		s_gamelist_rescan_after_vm = true;
+		s_gamelist_cancel.store(true, std::memory_order_release);
+	}
+
+	s_gamelist_idle_cv.wait(lock, []() { return !s_gamelist_scanning; });
+	if (s_gamelist_thread.joinable())
+		s_gamelist_thread.join();
 }
 
 void Host::RefreshGameListAsync(bool invalidate_cache)
 {
-	// Only one scan at a time — FullscreenUI's "rescan" button can fire
-	// multiple times in quick succession; coalesce by joining the previous
-	// scan first.
-	Pcsx2SDL::StopGameListRefreshThread();
+	std::lock_guard<std::mutex> lock(s_gamelist_lock);
 
-	s_gamelist_running.store(true, std::memory_order_release);
-	s_gamelist_thread = std::thread([invalidate_cache]() {
-		Threading::SetNameOfCurrentThread("GameList Refresh");
-		GameList::Refresh(invalidate_cache, false, nullptr);
-		s_gamelist_running.store(false, std::memory_order_release);
-	});
+	if (s_gamelist_blocked)
+	{
+		// The scan would fail on the CDVD lock. Do it when the VM is gone.
+		s_gamelist_rescan_after_vm = true;
+		return;
+	}
+
+	if (s_gamelist_scanning)
+	{
+		s_gamelist_rescan = true;
+		s_gamelist_rescan_invalidate |= invalidate_cache;
+		s_gamelist_cancel.store(true, std::memory_order_release);
+		return;
+	}
+
+	// The previous scan thread has finished, or is about to return without taking the lock again.
+	if (s_gamelist_thread.joinable())
+		s_gamelist_thread.join();
+
+	s_gamelist_cancel.store(false, std::memory_order_release);
+	s_gamelist_scanning = true;
+	s_gamelist_thread = std::thread(GameListScanThreadMain, invalidate_cache);
 }
 
 void Host::CancelGameListRefresh()
@@ -861,6 +1021,10 @@ void Pcsx2SDL::CPUThreadMain(VMBootParameters initial_params, bool start_in_fsui
 			return;
 		}
 		MTGS::SetRunIdle(true);
+
+		// Scan once at startup, as the Qt frontend does: without it the game picker opens on an empty list until
+		// the user asks for a refresh. Incremental (the cache is kept), on the background thread.
+		Host::RefreshGameListAsync(false);
 	}
 
 	// The "initial" boot is the ISO/state passed on the CLI. When launching
@@ -983,6 +1147,8 @@ int main(int argc, char* argv[])
 			std::fprintf(stderr, "Usage: %s [options] <iso-path>\n\n", argv[0]);
 			std::fprintf(stderr, "  --fullscreen-mode WxH    Request a specific display mode\n");
 			std::fprintf(stderr, "                           (default: monitor's preferred mode)\n");
+			std::fprintf(stderr, "  --headless WxH           No display: render to an offscreen WxH image (for PINE UIScreenshot)\n");
+			std::fprintf(stderr, "  -bigpicture              Start in Big Picture when no disc is given\n");
 			std::fprintf(stderr, "  --bios-only              Boot the BIOS without loading a disc\n");
 			std::fprintf(stderr, "  --state-from-file PATH   Resume from a save state file\n");
 			std::fprintf(stderr, "  --no-fast-boot           Skip fast boot (run full BIOS animation)\n");
@@ -1006,6 +1172,9 @@ int main(int argc, char* argv[])
 		return EXIT_FAILURE;
 	}
 
+	// Selected GPU driver pack (Linux): must be in the environment before anything loads libvulkan.
+	DriverPacks::ApplyEnvironment();
+
 	VMBootParameters params;
 	if (!Pcsx2SDL::ParseCommandLineArgs(argc, argv, params))
 		return EXIT_FAILURE;
@@ -1017,7 +1186,7 @@ int main(int argc, char* argv[])
 		// No ISO supplied and no --bios-only — only valid if the
 		// StartBigPictureMode flag is set, in which case the frontend starts
 		// in the FullscreenUI game-picker.
-		if (Host::GetBaseBoolSettingValue("UI", "StartBigPictureMode", true))
+		if (s_force_bigpicture || Host::GetBaseBoolSettingValue("UI", "StartBigPictureMode", true))
 		{
 			start_in_fsui = true;
 		}
@@ -1027,6 +1196,15 @@ int main(int argc, char* argv[])
 								 "or set UI/StartBigPictureMode=true in PCSX2.ini for the game-picker.\n");
 			return EXIT_FAILURE;
 		}
+	}
+
+	if (s_headless)
+	{
+		GSHeadless::SetEnabled(true);
+#ifdef ENABLE_OPENGL
+		// An EGL context with no window, for the OpenGL renderer. Only hosts that ask for it.
+		GLContext::AllowHeadless = true;
+#endif
 	}
 
 	Pcsx2SDL::InstallSignalHandler();

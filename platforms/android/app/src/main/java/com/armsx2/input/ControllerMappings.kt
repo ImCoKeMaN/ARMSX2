@@ -114,9 +114,13 @@ object ControllerMappings {
     private fun scopedKey(baseKey: String, serial: String?) =
         if (serial.isNullOrEmpty()) baseKey else gameKey(serial, baseKey)
 
-    /** Serial of the running game whose overrides apply at RUNTIME (input
-     *  dispatch), or null in menus so use falls back to global. */
-    private fun runtimeSerial(): String? = MainActivityRuntime.currentGame.value?.serial?.takeIf { it.isNotEmpty() }
+    /** Key of the running game whose overrides apply at RUNTIME (input
+     *  dispatch), or null in menus so use falls back to global. It is the game's
+     *  settingsKey, the same key the Pad tab writes under and the boot path resolves
+     *  every other per-game setting by: the serial for discs, the filename stem for
+     *  serial-less games. Reading the bare serial here dropped a serial-less game's
+     *  own mapping back to the global one in game. */
+    private fun runtimeSerial(): String? = MainActivityRuntime.currentGame.value?.settingsKey
 
     /** Read an int pref: per-game override (for the active game) first, else global. */
     private fun resolveInt(baseKey: String, default: Int): Int {
@@ -246,6 +250,10 @@ object ControllerMappings {
     fun setDpadAsLeftStick(on: Boolean, serial: String? = null) {
         MainActivityRuntime.prefs.edit { putBoolean(scopedKey(KEY_DPAD_AS_LSTICK, serial), on) }
         invalidateRuntimeCaches()
+    }
+    fun setDpadAsLeftStickForRunningGame(on: Boolean) {
+        val serial = runtimeSerial()?.takeIf { MainActivityRuntime.prefs.contains(gameKey(it, KEY_DPAD_AS_LSTICK)) }
+        setDpadAsLeftStick(on, serial)
     }
 
     // ---- Analog stick response shaping (physical sticks → PS2 analog) ----
@@ -417,7 +425,7 @@ object ControllerMappings {
      *
      * Only a DEFAULT. An explicit choice in the Pad tab is stored and always wins.
      */
-    private fun handheldWithBuiltInPad(): Boolean {
+    fun handheldWithBuiltInPad(): Boolean {
         val vendor = (android.os.Build.MANUFACTURER ?: "").lowercase()
         val brand = (android.os.Build.BRAND ?: "").lowercase()
         val model = (android.os.Build.MODEL ?: "").lowercase()
@@ -426,6 +434,11 @@ object ControllerMappings {
         // manufacturer like "dayna", and a false positive on a phone reintroduces #433.
         if (vendor == "ayn" || vendor == "gpd" || brand == "ayn" || brand == "gpd")
             return true
+
+        // Anbernic's Qualcomm handhelds put the SoC vendor in manufacturer and brand (the RG 55G1
+        // reports QUALCOMM / qti), so only the model names them: "RG 55G1", "RG 477V". Anchored
+        // at the start, with the space, so nothing merely containing "rg" matches.
+        if (model.startsWith("rg ")) return true
 
         // Distinctive enough to match anywhere in vendor, brand or model. Model matters
         // because these handhelds often report the SoC vendor as the brand: the Odin 3 says

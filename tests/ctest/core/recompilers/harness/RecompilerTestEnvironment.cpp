@@ -156,6 +156,12 @@ bool RecompilerTestEnvironment::Initialize()
 	mVUPersist::SetTestManualRecording(true);
 #endif
 
+	// vu-aot is on by default in the product; the tests start with it off. It also brings up the VU
+	// program cache (UseVUProgramCache), tags VU0's code with its tripwire hook and starts a worker
+	// thread, so a test that wants any of that sets EnableVUAot itself. Before the Reserve calls
+	// below, since mVUinit reads it.
+	EmuConfig.Cpu.Recompiler.EnableVUAot = false;
+
 	// microVU JITs. mVUinit allocates the per-VU regAlloc + sets cache
 	// pointers; the corresponding Reset call below emits dispatchers.
 	// CpuMicroVU1::Reserve also opens vu1Thread — with THREAD_VU1=false it
@@ -285,6 +291,33 @@ void RecompilerTestEnvironment::ResetVuBlockCache(int vu_index)
 		CpuMicroVU0.Reset();
 	else
 		CpuMicroVU1.Reset();
+}
+
+void RecompilerTestEnvironment::SetExtraMemory(bool enabled)
+{
+	// Steps 6-11 of Initialize, in the same order, with the map size changed
+	// first: memReset maps ExposedRam, and the recompilers' Reset rebuilds
+	// their LUTs when ExposedRam differs from the size they were built for.
+	memSetExtraMemMode(enabled);
+	SysMemory::Reset();
+	psxRec.Reset();
+	psxInt.Reset();
+	recCpu.Reset();
+	intCpu.Reset();
+	CpuMicroVU0.Reset();
+	CpuMicroVU1.Reset();
+	mmap_ResetBlockTracking();
+	psxCpu = &psxInt;
+	Cpu = &intCpu;
+	CpuVU0 = &CpuIntVU0;
+	CpuVU1 = &CpuIntVU1;
+	InstallParkingLot();
+	InstallEeExceptionVectorStubs();
+	psxRcntInit();
+	psxNextDeltaCounter = 0x7FFFFFFF;
+	psxNextStartCounter = 0;
+	nextDeltaCounter = 0x7FFFFFFF;
+	nextStartCounter = 0;
 }
 
 } // namespace recompiler_tests

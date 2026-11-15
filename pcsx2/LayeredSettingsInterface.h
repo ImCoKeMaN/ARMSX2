@@ -10,9 +10,14 @@
 class LayeredSettingsInterface final : public SettingsInterface
 {
 public:
+	// Lookup runs from the first layer to the last and the first layer holding a key wins.
 	enum Layer : u32
 	{
 		LAYER_CMDLINE,
+		// Values auto-tune is trying out, in memory only. Above the game layer so a trial beats the
+		// game's own file, below the command line so an explicit override still wins. Not stored in
+		// LAYER_CMDLINE: that slot holds what the player typed, which a trial must never outrank.
+		LAYER_AUTOTUNE,
 		LAYER_GAME,
 		LAYER_INPUT,
 		LAYER_SECRETS,

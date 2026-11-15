@@ -226,6 +226,16 @@ target_link_libraries(savers log GLESv2 m)
 
 add_subdirectory(3rdparty/adrenotools)
 
+# miniupnpc, for remote play's online hosting: asks the host's router to open the stream's port
+# (remote_play_upnp.cpp). The static library only: the Android Gradle plugin packages every shared
+# library and builds every executable it finds, so the samples, tests and shared build stay off.
+set(UPNPC_BUILD_STATIC ON)
+set(UPNPC_BUILD_SHARED OFF)
+set(UPNPC_BUILD_TESTS OFF)
+set(UPNPC_BUILD_SAMPLE OFF)
+set(UPNPC_NO_INSTALL ON)
+add_subdirectory(3rdparty/miniupnpc EXCLUDE_FROM_ALL)
+
 # pcsx2-gsrunner as an on-demand NDK executable for adb-shell replay runs on Android
 # devices. EXCLUDE_FROM_ALL keeps every APK build unchanged; build it explicitly with
 # --target pcsx2-gsrunner.
@@ -238,6 +248,21 @@ add_subdirectory("${ARMSX2_ROOT}/pcsx2-gsrunner" "${CMAKE_BINARY_DIR}/pcsx2-gsru
 option(ARMSX2_BUILD_DRIVERDIAG "Add the armsx2-driverdiag command-line tool (never part of the app)" OFF)
 if(ARMSX2_BUILD_DRIVERDIAG)
 	add_subdirectory("${ARMSX2_ROOT}/pcsx2-driverdiag" "${CMAKE_BINARY_DIR}/pcsx2-driverdiag" EXCLUDE_FROM_ALL)
+endif()
+
+# pcsx2-eerunner, the headless EE runner, as an adb-shell tool for profiling identical
+# runs across devices. Behind an option for the same reason as driverdiag above: the Android
+# Gradle plugin builds every executable target it finds, whatever EXCLUDE_FROM_ALL says.
+# It is never packaged. Build it with -DARMSX2_BUILD_EERUNNER=ON and --target pcsx2-eerunner;
+# add -DUSE_PERF_JITDUMP=ON for its --perf-jitdump symbol dump.
+option(ARMSX2_BUILD_EERUNNER "Add the pcsx2-eerunner command-line tool (never part of the app)" OFF)
+if(ARMSX2_BUILD_EERUNNER)
+	# The eerunner drives the EE recompiler through the test hooks (EERecFallback, the twin
+	# counters); without them it fails to compile with undeclared identifiers.
+	if(NOT ENABLE_RECOMPILER_TEST_HOOKS)
+		message(FATAL_ERROR "ARMSX2_BUILD_EERUNNER requires -DENABLE_RECOMPILER_TEST_HOOKS=ON.")
+	endif()
+	add_subdirectory("${ARMSX2_ROOT}/pcsx2-eerunner" "${CMAKE_BINARY_DIR}/pcsx2-eerunner" EXCLUDE_FROM_ALL)
 endif()
 
 # librashader: RetroArch (.slangp) shader chains for the GS post-process path, for BOTH
@@ -302,7 +327,35 @@ set(ARMSX2_EMUCORE_LIBRARY_NAME "emucore_4k" CACHE STRING "Android emucore share
 
 add_library(${ARMSX2_EMUCORE_LIBRARY_NAME} SHARED
 	native-lib.cpp
+	remote_play.cpp
+	remote_play_upnp.cpp
 )
+
+# Android before 10 (API 29) has no ELF TLS. Its linker ignores R_AARCH64_TLSDESC, so the descriptor
+# stays zero and the first thread_local access calls address 0 (armSetAsmPtr in VifUnpackSSE_Init,
+# at every game start). A build whose minimum API is below 29 must use emulated TLS.
+#
+# The compiler already chooses emulated TLS for API 26, but the core reaches this link as ThinLTO
+# bitcode (PCSX2_LTO), and this link line carries no -flto. Without it the clang driver does not
+# forward its code generation options to lld's LTO step, which then defaults to native TLS. Give the
+# LTO step the option directly. Builds for API 29 and up are unchanged.
+#
+# ANDROID_PLATFORM_LEVEL is the minimum API in both of the NDK's toolchain flows. Not
+# CMAKE_SYSTEM_VERSION: the legacy flow, which AGP uses, sets that to a placeholder 1.
+set(ARMSX2_ANDROID_MIN_API "${ANDROID_PLATFORM_LEVEL}")
+if(NOT ARMSX2_ANDROID_MIN_API MATCHES "^[0-9]+$")
+	message(FATAL_ERROR "Cannot tell the minimum Android API (ANDROID_PLATFORM_LEVEL='${ANDROID_PLATFORM_LEVEL}'), so cannot choose the TLS model for the core")
+endif()
+if(ARMSX2_ANDROID_MIN_API LESS 29)
+	target_link_options(${ARMSX2_EMUCORE_LIBRARY_NAME} PRIVATE "-Wl,-plugin-opt=-emulated-tls")
+	# Fail the build rather than ship a core that cannot start on its own minimum Android version.
+	if(CMAKE_READELF)
+		add_custom_command(TARGET ${ARMSX2_EMUCORE_LIBRARY_NAME} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -DREADELF=${CMAKE_READELF} -DLIB=$<TARGET_FILE:${ARMSX2_EMUCORE_LIBRARY_NAME}>
+				-DMIN_API=${ARMSX2_ANDROID_MIN_API} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckNoElfTls.cmake
+			VERBATIM)
+	endif()
+endif()
 
 # The Discord bridge is its OWN shared library, and emucore must never link it.
 #
@@ -337,7 +390,10 @@ target_link_libraries(${ARMSX2_EMUCORE_LIBRARY_NAME} PRIVATE
 	vixl
 	adrenotools
 	Zstd::Zstd
+	libminiupnpc-static
 	android
+	EGL
+	GLESv2
 	log
 )
 

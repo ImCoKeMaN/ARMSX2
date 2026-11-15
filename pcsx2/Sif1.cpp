@@ -7,6 +7,9 @@
 #include "Common.h"
 #include "Sif.h"
 #include "IopHw.h"
+#include "IopThread/IopBridge.h"
+#include "IopThread/OwnerAsserts.h"
+#include "IopThread/SharedWord.h"
 
 _sif sif1;
 
@@ -253,16 +256,50 @@ static __fi void HandleIOPTransfer()
 
 static __fi void Sif1End()
 {
-	psHu32(SBUS_F240) &= ~0x40;
-	psHu32(SBUS_F240) &= ~0x4000;
+	// Both bits in one step: the other side changes this register too.
+	SharedWord::FetchAnd(psHu32(SBUS_F240), ~(0x40u | 0x4000u));
 
 	DMA_LOG("SIF1 DMA End");
+}
+
+// One step of the EE side's transfer, if it is busy, not held by the DMAC's stall control, and can move.
+// Returns whether a step ran. The step can set the stall flag, which holds the EE side for the rest of this
+// call and the calls after it.
+static __fi bool Sif1EeStep()
+{
+	EE_SIDE_ASSERT();
+
+	if (sif1.ee.busy && !sif1_dma_stall)
+	{
+		if(sif1.fifo.sif_free() > 0 || (sif1.ee.end && sif1ch.qwc == 0))
+		{
+			HandleEETransfer();
+			return true;
+		}
+	}
+	return false;
+}
+
+// One step of the IOP side's transfer, if it is busy and can move. Returns whether a step ran.
+static __fi bool Sif1IopStep()
+{
+	IOP_SIDE_ASSERT();
+
+	if (sif1.iop.busy)
+	{
+		if(sif1.fifo.size >= 4 || (sif1.iop.end && sif1.iop.counter == 0))
+		{
+			HandleIOPTransfer();
+			return true;
+		}
+	}
+	return false;
 }
 
 // Transfer EE to IOP, putting data in the fifo as an intermediate step.
 __fi void SIF1Dma()
 {
-	int BusyCheck = 0;
+	bool moved;
 
 	if (sif1_dma_stall)
 	{
@@ -276,28 +313,12 @@ __fi void SIF1Dma()
 
 	do
 	{
-		//I realise this is very hacky in a way but its an easy way of checking if both are doing something
-		BusyCheck = 0;
-
-		if (sif1.ee.busy && !sif1_dma_stall)
-		{
-			if(sif1.fifo.sif_free() > 0 || (sif1.ee.end && sif1ch.qwc == 0))
-			{
-				BusyCheck++;
-				HandleEETransfer();
-			}
-		}
-
-		if (sif1.iop.busy)
-		{
-			if(sif1.fifo.size >= 4 || (sif1.iop.end && sif1.iop.counter == 0))
-			{
-				BusyCheck++;
-				HandleIOPTransfer();
-			}
-		}
-
-	} while (/*!done &&*/ BusyCheck > 0);
+		// The EE side first, then the IOP side, and both every time: one pass is two statements and not
+		// `Sif1EeStep() + Sif1IopStep()`, whose operands C++ does not put in an order.
+		const bool ee_moved = Sif1EeStep();
+		const bool iop_moved = Sif1IopStep();
+		moved = ee_moved || iop_moved;
+	} while (/*!done &&*/ moved);
 
 	Sif1End();
 }
@@ -314,6 +335,17 @@ __fi void  EEsif1Interrupt()
 	sif1ch.chcr.STR = false;
 }
 
+// The part of the EE's start that has an effect on the IOP's side of the machine: the EE side is marked busy
+// (an IOP-started pump moves the EE's data into IOP RAM only while it is) and the pump runs. See SIF0DmaFromEe.
+// The F240 bit is cleared again at the end of SIF1Dma, except when SIF1Dma returns early because the DMAC's
+// stall control still holds the transfer; that is the case before and after this function existed.
+__fi void SIF1DmaFromEe()
+{
+	SharedWord::FetchOr(psHu32(SBUS_F240), 0x4000u);
+	sif1.ee.busy = true;
+	SIF1Dma();
+}
+
 // Do almost exactly the same thing as psxDma10 in IopDma.cpp.
 // Main difference is this checks for iop, where psxDma10 checks for ee.
 __fi void dmaSIF1()
@@ -324,9 +356,6 @@ __fi void dmaSIF1()
 	{
 		SIF_LOG("warning, sif1.fifoReadPos != sif1.fifoWritePos");
 	}
-
-	psHu32(SBUS_F240) |= 0x4000;
-	sif1.ee.busy = true;
 
 	CPU_SET_DMASTALL(DMAC_SIF1, false);
 	// Okay, this here is needed currently (r3644).
@@ -349,6 +378,7 @@ __fi void dmaSIF1()
 		}
 	}
 
-	SIF1Dma();
+	// The F240 busy bit and sif1.ee.busy are set by SIF1DmaFromEe, where the pump starts.
+	IopBridge::Sif1Pump();
 
 }

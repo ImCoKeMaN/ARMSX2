@@ -7,6 +7,9 @@
 #include "Common.h"
 #include "Sif.h"
 #include "IopHw.h"
+#include "IopThread/IopBridge.h"
+#include "IopThread/OwnerAsserts.h"
+#include "IopThread/SharedWord.h"
 
 _sif sif0;
 
@@ -283,47 +286,67 @@ static __fi void HandleIOPTransfer()
 
 static __fi void Sif0End()
 {
-	psHu32(SBUS_F240) &= ~0x20;
-	psHu32(SBUS_F240) &= ~0x2000;
+	// Both bits in one step: the other side changes this register too.
+	SharedWord::FetchAnd(psHu32(SBUS_F240), ~(0x20u | 0x2000u));
 
 	DMA_LOG("SIF0 DMA End");
+}
+
+// IOP side of the pump: write the junk words that pad out the last packet's quadword (whenever the IOP
+// has nothing left of that packet and the FIFO has room, busy or not), then one transfer step if busy
+// and able. Returns whether the transfer step ran; the junk write does not count.
+static __fi bool Sif0IopStep()
+{
+	IOP_SIDE_ASSERT();
+
+	if (sif0.iop.counter == 0 && sif0.iop.writeJunk && sif0.fifo.sif_free() >= sif0.iop.writeJunk)
+	{
+		SIF_LOG("Writing Junk %d", sif0.iop.writeJunk);
+		sif0.fifo.writeJunk(sif0.iop.writeJunk);
+		sif0.iop.writeJunk = 0;
+	}
+
+	if (sif0.iop.busy)
+	{
+		if(sif0.fifo.sif_free() > 0 || (sif0.iop.end && sif0.iop.counter == 0))
+		{
+			HandleIOPTransfer();
+			return true;
+		}
+	}
+	return false;
+}
+
+// EE side of the pump. Returns whether the transfer step ran.
+static __fi bool Sif0EeStep()
+{
+	EE_SIDE_ASSERT();
+
+	if (sif0.ee.busy)
+	{
+		if(sif0.fifo.size >= 4 || (sif0.ee.end && sif0ch.qwc == 0))
+		{
+			HandleEETransfer();
+			return true;
+		}
+	}
+	return false;
 }
 
 // Transfer IOP to EE, putting data in the fifo as an intermediate step.
 __fi void SIF0Dma()
 {
-	int BusyCheck = 0;
+	bool moved;
 	Sif0Init();
 
 	do
 	{
-		//I realise this is very hacky in a way but its an easy way of checking if both are doing something
-		BusyCheck = 0;
-
-		if (sif0.iop.counter == 0 && sif0.iop.writeJunk && sif0.fifo.sif_free() >= sif0.iop.writeJunk)
-		{
-			SIF_LOG("Writing Junk %d", sif0.iop.writeJunk);
-			sif0.fifo.writeJunk(sif0.iop.writeJunk);
-			sif0.iop.writeJunk = 0;
-		}
-
-		if (sif0.iop.busy)
-		{
-			if(sif0.fifo.sif_free() > 0 || (sif0.iop.end && sif0.iop.counter == 0))
-			{
-				BusyCheck++;
-				HandleIOPTransfer();
-			}
-		}
-		if (sif0.ee.busy)
-		{
-			if(sif0.fifo.size >= 4 || (sif0.ee.end && sif0ch.qwc == 0))
-			{
-				BusyCheck++;
-				HandleEETransfer();
-			}
-		}
-	} while (/*!done && */BusyCheck > 0); // Substituting (sif0.ee.busy || sif0.iop.busy) breaks things.
+		// The IOP side first, then the EE side, and both every time: one pass is two statements and not
+		// `Sif0IopStep() + Sif0EeStep()`, whose operands C++ does not put in an order.
+		const bool iop_moved = Sif0IopStep();
+		const bool ee_moved = Sif0EeStep();
+		moved = iop_moved || ee_moved;
+	} while (/*!done && */moved); // Substituting (sif0.ee.busy || sif0.iop.busy) breaks things.
 
 	Sif0End();
 }
@@ -340,6 +363,18 @@ __fi void  EEsif0Interrupt()
 	sif0ch.chcr.STR = false;
 }
 
+// The part of the EE's start that has an effect on the IOP's side of the machine: the EE side is marked busy
+// (an IOP-started pump moves data into the EE only while it is) and the pump runs. It has no effect of its own
+// that anything can see before the pump finishes: the F240 bit it sets is cleared again at the end of SIF0Dma.
+// Run in place with the IOP held, or later, from the IOP's queue, when the IOP thread defers the pump so that
+// the data moves at the IOP's time of the start and not at the EE's.
+__fi void SIF0DmaFromEe()
+{
+	SharedWord::FetchOr(psHu32(SBUS_F240), 0x2000u);
+	sif0.ee.busy = true;
+	SIF0Dma();
+}
+
 __fi void dmaSIF0()
 {
 	SIF_LOG("dmaSIF0 %s", sif0ch.cmqt_to_str().c_str());
@@ -350,8 +385,6 @@ __fi void dmaSIF0()
 	}
 
 	//if(sif0ch.chcr.MOD == CHAIN_MODE && sif0ch.qwc > 0) DevCon.Warning(L"SIF0 QWC on Chain CHCR " + sif0ch.chcr.desc());
-	psHu32(SBUS_F240) |= 0x2000;
-	sif0.ee.busy = true;
 
 	// Okay, this here is needed currently (r3644).
 	// FFX battles in the thunder plains map die otherwise, Phantasy Star 4 as well
@@ -365,6 +398,7 @@ __fi void dmaSIF0()
 	// Legend of Legaia doesn't throw a warning either :)
 	sif0.ee.end = false;
 	CPU_SET_DMASTALL(DMAC_SIF0, false);
-	SIF0Dma();
+	// The F240 busy bit and sif0.ee.busy are set by SIF0DmaFromEe, where the pump starts.
+	IopBridge::Sif0Pump();
 
 }

@@ -4,6 +4,9 @@
     <Filter Include="Misc">
       <UniqueIdentifier>{d1e5f218-107b-4e8c-9527-55cb9388b544}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Misc\Catalog">
+      <UniqueIdentifier>{4c0e63a0-cad6-4a95-8a70-f069c08cb79f}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Misc\Utilities">
       <UniqueIdentifier>{acd41072-b36e-4653-a430-40ade53fb78a}</UniqueIdentifier>
     </Filter>
@@ -629,6 +632,27 @@
     <ClCompile Include="IopMem.cpp">
       <Filter>System\Ps2\Iop</Filter>
     </ClCompile>
+    <ClCompile Include="IopThread\IopChannels.cpp">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClCompile>
+    <ClCompile Include="IopThread\IopLagControl.cpp">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClCompile>
+    <ClCompile Include="IopThread\IopLagRules.cpp">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClCompile>
+    <ClCompile Include="IopThread\IopPlacement.cpp">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClCompile>
+    <ClCompile Include="IopThread\IopThread.cpp">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClCompile>
+    <ClCompile Include="IopThread\IopThreadMode.cpp">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClCompile>
+    <ClCompile Include="IopThread\IopThreadVm.cpp">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClCompile>
     <ClCompile Include="R3000A.cpp">
       <Filter>System\Ps2\Iop</Filter>
     </ClCompile>
@@ -1022,6 +1046,12 @@
     <ClCompile Include="GS\GSCacheFile.cpp">
       <Filter>System\Ps2\GS</Filter>
     </ClCompile>
+    <ClCompile Include="GS\GSBlockId.cpp">
+      <Filter>System\Ps2\GS</Filter>
+    </ClCompile>
+    <ClCompile Include="GS\GSCompileQueue.cpp">
+      <Filter>System\Ps2\GS</Filter>
+    </ClCompile>
     <ClCompile Include="GS\GSClut.cpp">
       <Filter>System\Ps2\GS</Filter>
     </ClCompile>
@@ -1115,6 +1145,9 @@
     <ClCompile Include="GS\Renderers\HW\GSRendererHW.cpp">
       <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
     </ClCompile>
+    <ClCompile Include="GS\Renderers\HW\GSRendererHWBurstMemo.cpp">
+      <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
+    </ClCompile>
     <ClCompile Include="GS\Renderers\HW\GSRendererHWMultiISA.cpp">
       <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
     </ClCompile>
@@ -1134,6 +1167,9 @@
       <Filter>System\Ps2\GS\Renderers\Common</Filter>
     </ClCompile>
     <ClCompile Include="GS\Renderers\Common\GSDevice.cpp">
+      <Filter>System\Ps2\GS\Renderers\Common</Filter>
+    </ClCompile>
+    <ClCompile Include="GS\Renderers\Common\GSHeadlessPresent.cpp">
       <Filter>System\Ps2\GS\Renderers\Common</Filter>
     </ClCompile>
     <ClCompile Include="GS\Renderers\Common\GSTexture.cpp">
@@ -1189,6 +1225,9 @@
     </ClCompile>
     <ClCompile Include="GS\Renderers\DX11\D3D.cpp">
       <Filter>System\Ps2\GS\Renderers\Direct3D11</Filter>
+    </ClCompile>
+    <ClCompile Include="GS\Renderers\Vulkan\GSRunsVK.cpp">
+      <Filter>System\Ps2\GS\Renderers\Vulkan</Filter>
     </ClCompile>
     <ClCompile Include="GS\Renderers\Vulkan\GSTextureVK.cpp">
       <Filter>System\Ps2\GS\Renderers\Vulkan</Filter>
@@ -1397,6 +1436,15 @@
     <ClCompile Include="Counters.cpp">
       <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
     </ClCompile>
+    <ClCompile Include="EECycleRate.cpp">
+      <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
+    </ClCompile>
+    <ClCompile Include="EECycleRateController.cpp">
+      <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
+    </ClCompile>
+    <ClCompile Include="EECycleRateSampler.cpp">
+      <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
+    </ClCompile>
     <ClCompile Include="ps2\BiosTools.cpp">
       <Filter>Misc</Filter>
     </ClCompile>
@@ -1430,6 +1478,93 @@
     <ClCompile Include="Achievements.cpp">
       <Filter>Tools</Filter>
     </ClCompile>
+    <ClCompile Include="Arcade\AcGameFile.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="Arcade\ArcadeFiles.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="Arcade\ArcadeInput.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="Arcade\ArcadeSetup.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="AutoTune\AutoTuneApplier.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="AutoTune\AutoTuneController.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="AutoTune\AutoTuneSampler.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="AutoTune\AutoTuneStore.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="Autosave.cpp">
+      <Filter>Misc</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\CoverAutoDownload.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\CoverDownloadJob.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\CoverSources.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\DriverPacks.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\FileUtil.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\HttpFetcher.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\HttpTransportWinHTTP.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\Json.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\LocalLinkSettings.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\PatchRepo.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\PnachText.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\ResponseCache.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\TarGz.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\TarZstdExtractor.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\TextureArchivePath.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\TexturePackCatalog.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\TexturePackEngine.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\TexturePackInstaller.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\TexturePackState.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
+    <ClCompile Include="Catalog\ZipTextureExtractor.cpp">
+      <Filter>Misc\Catalog</Filter>
+    </ClCompile>
     <ClCompile Include="Hotkeys.cpp">
       <Filter>Misc</Filter>
     </ClCompile>
@@ -1448,10 +1583,37 @@
     <ClCompile Include="ImGui\FullscreenUI.cpp">
       <Filter>Misc\ImGui</Filter>
     </ClCompile>
+    <ClCompile Include="ImGui\FullscreenUI_Arcade.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ImGui\FullscreenUI_Drivers.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ImGui\FullscreenUI_OnlinePatches.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ImGui\FullscreenUI_Packs.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ImGui\FullscreenUI_Saves.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
     <ClCompile Include="ImGui\FullscreenUI_Settings.cpp">
       <Filter>Misc\ImGui</Filter>
     </ClCompile>
+    <ClCompile Include="ImGui\FullscreenUI_TexturePacks.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ImGui\FullscreenUIShot.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
     <ClCompile Include="ImGui\ImGuiFullscreen.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ImGui\ImGuiFullscreen_Keyboard.cpp">
+      <Filter>Misc\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ImGui\OnScreenKeyboardModel.cpp">
       <Filter>Misc\ImGui</Filter>
     </ClCompile>
     <ClCompile Include="CDVD\IsoHasher.cpp">
@@ -1462,6 +1624,9 @@
     </ClCompile>
     <ClCompile Include="SIO\Multitap\MultitapProtocol.cpp">
       <Filter>System\Ps2\Iop\SIO\Multitap</Filter>
+    </ClCompile>
+    <ClCompile Include="SIO\Memcard\MemcardBackup.cpp">
+      <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
     </ClCompile>
     <ClCompile Include="SIO\Memcard\MemoryCardFile.cpp">
       <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
@@ -1674,6 +1839,39 @@
       <Filter>System\Ps2\Iop</Filter>
     </ClInclude>
     <ClInclude Include="IopMem.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\EeBridge.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\IopBridge.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\IopChannels.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\IopLagControl.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\IopLagRules.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\IopPlacement.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\IopThread.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\IopThreadMode.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\IopThreadVm.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\OwnerAsserts.h">
+      <Filter>System\Ps2\Iop</Filter>
+    </ClInclude>
+    <ClInclude Include="IopThread\SharedWord.h">
       <Filter>System\Ps2\Iop</Filter>
     </ClInclude>
     <ClInclude Include="R3000A.h">
@@ -2015,6 +2213,9 @@
     <ClInclude Include="GS\GSCacheFile.h">
       <Filter>System\Ps2\GS</Filter>
     </ClInclude>
+    <ClInclude Include="GS\GSBlockId.h">
+      <Filter>System\Ps2\GS</Filter>
+    </ClInclude>
     <ClInclude Include="GS\GSClut.h">
       <Filter>System\Ps2\GS</Filter>
     </ClInclude>
@@ -2025,6 +2226,9 @@
       <Filter>System\Ps2\GS</Filter>
     </ClInclude>
     <ClInclude Include="GS\GSLocalMemory.h">
+      <Filter>System\Ps2\GS</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\GSCompileQueue.h">
       <Filter>System\Ps2\GS</Filter>
     </ClInclude>
     <ClInclude Include="GS\GSCompileStats.h">
@@ -2135,6 +2339,9 @@
     <ClInclude Include="GS\Renderers\SW\GSPerspectivePlane.h">
       <Filter>System\Ps2\GS\Renderers\Software</Filter>
     </ClInclude>
+    <ClInclude Include="GS\Renderers\SW\GSStqExtremes.h">
+      <Filter>System\Ps2\GS\Renderers\Software</Filter>
+    </ClInclude>
     <ClInclude Include="GS\Renderers\SW\GSScanlineEnvironment.h">
       <Filter>System\Ps2\GS\Renderers\Software</Filter>
     </ClInclude>
@@ -2148,6 +2355,12 @@
       <Filter>System\Ps2\GS\Renderers\Software</Filter>
     </ClInclude>
     <ClInclude Include="GS\Renderers\SW\GSSwTextureDirty.h">
+      <Filter>System\Ps2\GS\Renderers\Software</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Renderers\SW\GSSwTargetAlias.h">
+      <Filter>System\Ps2\GS\Renderers\Software</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Renderers\SW\GSSwTextureReaders.h">
       <Filter>System\Ps2\GS\Renderers\Software</Filter>
     </ClInclude>
     <ClInclude Include="GS\Renderers\SW\GSVertexSW.h">
@@ -2180,6 +2393,9 @@
     <ClInclude Include="GS\Renderers\Common\GSDevice.h">
       <Filter>System\Ps2\GS\Renderers\Common</Filter>
     </ClInclude>
+    <ClInclude Include="GS\Renderers\Common\GSHeadlessPresent.h">
+      <Filter>System\Ps2\GS\Renderers\Common</Filter>
+    </ClInclude>
     <ClInclude Include="GS\Renderers\Common\GSShaderEnums.h">
       <Filter>System\Ps2\GS\Renderers\Common</Filter>
     </ClInclude>
@@ -2209,6 +2425,9 @@
     </ClInclude>
     <ClInclude Include="PerformanceMetrics.h">
       <Filter>System\Include</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Renderers\Vulkan\GSRunsVK.h">
+      <Filter>System\Ps2\GS\Renderers\Vulkan</Filter>
     </ClInclude>
     <ClInclude Include="GS\Renderers\Vulkan\GSTextureVK.h">
       <Filter>System\Ps2\GS\Renderers\Vulkan</Filter>
@@ -2436,8 +2655,113 @@
     <ClInclude Include="Counters.h">
       <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
     </ClInclude>
+    <ClInclude Include="EECycleRate.h">
+      <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
+    </ClInclude>
+    <ClInclude Include="EECycleRateController.h">
+      <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
+    </ClInclude>
+    <ClInclude Include="EECycleRateSampler.h">
+      <Filter>System\Ps2\EmotionEngine\Hardware</Filter>
+    </ClInclude>
     <ClInclude Include="Achievements.h">
       <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="Arcade\AcGameFile.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="Arcade\ArcadeFiles.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="Arcade\ArcadeInput.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="Arcade\ArcadeSetup.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="AutoTune\AutoTuneApplier.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="AutoTune\AutoTuneController.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="AutoTune\AutoTuneSampler.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="AutoTune\AutoTuneStore.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="Autosave.h">
+      <Filter>Misc</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\BlockingAnswer.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\CancelToken.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\CoverAutoDownload.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\CoverDownloadJob.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\CoverSources.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\DriverPacks.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\Fetch.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\FileOps.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\FileUtil.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\HttpFetcher.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\Json.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\LocalLinkSettings.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\PatchRepo.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\PnachText.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\ResponseCache.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\TarGz.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\TarZstdExtractor.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\TextureArchivePath.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\TexturePackCatalog.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\TexturePackEngine.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\TexturePackInstaller.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\TexturePackState.h">
+      <Filter>Misc\Catalog</Filter>
+    </ClInclude>
+    <ClInclude Include="Catalog\ZipTextureExtractor.h">
+      <Filter>Misc\Catalog</Filter>
     </ClInclude>
     <ClInclude Include="Input\AndroidNativeRumble.h">
       <Filter>Misc\Input</Filter>
@@ -2484,7 +2808,19 @@
     <ClInclude Include="ImGui\FullscreenUI_Internal.h">
       <Filter>Misc\ImGui</Filter>
     </ClInclude>
+    <ClInclude Include="ImGui\FullscreenUI_PageDwell.h">
+      <Filter>Misc\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ImGui\FullscreenUIShot.h">
+      <Filter>Misc\ImGui</Filter>
+    </ClInclude>
     <ClInclude Include="ImGui\ImGuiFullscreen.h">
+      <Filter>Misc\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ImGui\ImGuiFullscreen_Keyboard.h">
+      <Filter>Misc\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ImGui\OnScreenKeyboardModel.h">
       <Filter>Misc\ImGui</Filter>
     </ClInclude>
     <ClInclude Include="CDVD\IsoHasher.h">
@@ -2495,6 +2831,9 @@
     </ClInclude>
     <ClInclude Include="SIO\Multitap\MultitapProtocol.h">
       <Filter>System\Ps2\Iop\SIO\Multitap</Filter>
+    </ClInclude>
+    <ClInclude Include="SIO\Memcard\MemcardBackup.h">
+      <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
     </ClInclude>
     <ClInclude Include="SIO\Memcard\MemoryCardFile.h">
       <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
@@ -2624,6 +2963,9 @@
     <ClCompile Include="GS\Renderers\Common\GSPassScheduler.cpp">
       <Filter>System\Ps2\GS\Renderers\Common</Filter>
     </ClCompile>
+    <ClCompile Include="GS\Renderers\HW\GSBurstMemo.cpp">
+      <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
+    </ClCompile>
     <ClCompile Include="GS\Renderers\HW\GSDrawLog.cpp">
       <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
     </ClCompile>
@@ -2663,7 +3005,13 @@
     <ClInclude Include="GS\Renderers\Common\GSFieldShiftPolicy.h">
       <Filter>System\Ps2\GS</Filter>
     </ClInclude>
+    <ClInclude Include="GS\Renderers\Common\GSBlendCarry.h">
+      <Filter>System\Ps2\GS</Filter>
+    </ClInclude>
     <ClInclude Include="GS\Renderers\Common\GSBlendConstantPolicy.h">
+      <Filter>System\Ps2\GS</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Renderers\Common\GSRunsPolicy.h">
       <Filter>System\Ps2\GS</Filter>
     </ClInclude>
     <ClInclude Include="GS\Renderers\Common\GSBackThreadPolicy.h">
@@ -2679,6 +3027,9 @@
       <Filter>System\Ps2\GS</Filter>
     </ClInclude>
     <ClInclude Include="GS\Renderers\Common\GSFastStencilShadow.h">
+      <Filter>System\Ps2\GS</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Renderers\Common\GSStencilCounter.h">
       <Filter>System\Ps2\GS</Filter>
     </ClInclude>
     <ClInclude Include="GS\Renderers\Common\GSFramebufferFetchPolicy.h">
@@ -2744,10 +3095,19 @@
     <ClInclude Include="GS\Renderers\HW\GSAlphaKnownBits.h">
       <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
     </ClInclude>
+    <ClInclude Include="GS\Renderers\HW\GSTargetRebase.h">
+      <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
+    </ClInclude>
     <ClInclude Include="GS\Renderers\HW\GSDepthCoverage.h">
       <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
     </ClInclude>
     <ClInclude Include="GS\Renderers\HW\GSDrawAlphaMask.h">
+      <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Renderers\HW\GSBurstMemo.h">
+      <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
+    </ClInclude>
+    <ClInclude Include="GS\Renderers\HW\GSDepthFormatMove.h">
       <Filter>System\Ps2\GS\Renderers\Hardware</Filter>
     </ClInclude>
     <ClInclude Include="GS\Renderers\HW\GSDrawLog.h">

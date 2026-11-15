@@ -18,6 +18,10 @@ import com.armsx2.ui.InGameOverlay
 import androidx.core.content.edit
 import kotlin.math.roundToInt
 
+/** The lag bounds the IOP thread's picker offers, in EE cycles. 4915200 is one frame and the default of
+ *  [com.armsx2.config.CpuSettings.iopThreadLag]; the others are the earlier choices. */
+internal val IOP_THREAD_LAG_CHOICES = listOf(4096, 6144, 12288, 24576, 4915200)
+
 /**
  * Performance section of the in-game settings overlay.
  *
@@ -44,6 +48,17 @@ fun PerformanceTab(state: MutableState<Settings>) {
         modifier = Modifier
             .fillMaxWidth(),
     ) {
+        // Automatic performance tuning: when a game keeps missing frames, the core tries
+        // performance settings one at a time and keeps the ones that help, in that game's own
+        // settings. The per-game list of what it changed, and its Reset, sit under it.
+        ToggleRow(
+            label = str("perf.autoTune.label"),
+            value = s.emuCore.autoTune,
+            description = str("perf.autoTune.description"),
+            field = "autoTune",
+        ) { apply(s.copy(emuCore = s.emuCore.copy(autoTune = it))) }
+        AutoTuneSection(state)
+        SettingsDivider()
         // Prominent latency preset: zero queued GS frames keeps the emulated CPU
         // from running ahead of presentation, and the Surface requests a matching
         // high-refresh display mode. Settings scope is supplied by InGameOverlay,
@@ -440,6 +455,18 @@ fun PerformanceTab(state: MutableState<Settings>) {
         CollapsibleSection(str("perf.advancedSpeedhacks.title")) {
             Spacer(Modifier.height(8.dp))
             ToggleRow(str("perf.hack.mtvu"), s.cpu.mtvu, description = str("perf.hack.mtvu.desc"), field = "mtvu") { apply(s.copy(cpu = s.cpu.copy(mtvu = it))) }
+            ToggleRow(str("perf.hack.iopThread"), s.cpu.iopThread, description = str("perf.hack.iopThread.desc"), field = "iopThread") { apply(s.copy(cpu = s.cpu.copy(iopThread = it))) }
+            // The lag bound is advanced: only the usual choices are offered, and a value the file holds
+            // that is not one of them shows the nearest (the core clamps it to 4096..9830400, two frames, anyway).
+            val lagChoices = IOP_THREAD_LAG_CHOICES
+            SegmentedRow(
+                label = str("perf.hack.iopThreadLag"),
+                options = lagChoices.map { it.toString() },
+                selectedIndex = lagChoices.indices.minByOrNull { kotlin.math.abs(lagChoices[it] - s.cpu.iopThreadLag) } ?: 1,
+                description = str("perf.hack.iopThreadLag.desc"),
+                field = "iopThreadLag",
+            ) { apply(s.copy(cpu = s.cpu.copy(iopThreadLag = lagChoices[it]))) }
+            ToggleRow(str("perf.hack.vuAot"), s.cpu.vuAot, description = str("perf.hack.vuAot.desc"), field = "vuAot") { apply(s.copy(cpu = s.cpu.copy(vuAot = it))) }
             ToggleRow(str("perf.hack.instantVu1"), s.cpu.vu1Instant, description = str("perf.hack.instantVu1.desc"), field = "vu1Instant") { apply(s.copy(cpu = s.cpu.copy(vu1Instant = it))) }
             ToggleRow(str("perf.hack.vuFlagHack"), s.cpu.vuFlagHack, description = str("perf.hack.vuFlagHack.desc"), field = "vuFlagHack") { apply(s.copy(cpu = s.cpu.copy(vuFlagHack = it))) }
             ToggleRow(str("perf.hack.fastCdvd"), s.cpu.fastCDVD, description = str("perf.hack.fastCdvd.desc"), field = "fastCDVD") { apply(s.copy(cpu = s.cpu.copy(fastCDVD = it))) }

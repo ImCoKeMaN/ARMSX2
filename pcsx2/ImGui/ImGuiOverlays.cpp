@@ -4,6 +4,7 @@
 #include "BuildVersion.h"
 #include "Config.h"
 #include "Counters.h"
+#include "EECycleRateSampler.h"
 #include "GS/GS.h"
 #include "GS/GSShaderCompileIndicator.h"
 #include "GS/GSVector.h"
@@ -21,6 +22,7 @@
 #include "ImGui/ImGuiManager.h"
 #include "ImGui/ImGuiOverlays.h"
 #include "Input/InputManager.h"
+#include "IopThread/IopThreadVm.h"
 #include "MTGS.h"
 #include "Patch.h"
 #include "PerformanceMetrics.h"
@@ -78,6 +80,9 @@ SmallString s_cpu_usage_ee_line;
 SmallString s_cpu_usage_gs_line;
 SmallString s_cpu_usage_gs_back_line;
 SmallString s_cpu_usage_vu_line;
+SmallString s_cpu_usage_iop_line;
+// Devel builds, Threaded mode: the IOP thread's waits and queues per frame.
+SmallString s_iop_thread_line;
 std::vector<SmallString> s_software_thread_lines;
 SmallString s_gpu_usage_line;
 SmallString s_gpu_debug_info_line;
@@ -291,10 +296,9 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 	// below keys off this word changing — sharing a bit would leave the block sized for the wrong
 	// set of lines the moment the LSFG line appeared or went away.
 	//
-	// The line comes with the rest of the performance overlay, so with the overlay off a healthy
-	// frame generation shows nothing (it stayed on screen whatever the overlay said, and with it,
-	// ImGui always drew, which kept frame generation off the game's own image). A problem still
-	// shows on its own: "on but silent" can't be told from "on and broken".
+	// The line shows only with the performance overlay on, so with it off a healthy frame
+	// generation draws nothing (any ImGui draw keeps frame generation off the game's own image).
+	// A problem still shows on its own: "on but silent" can't be told from "on and broken".
 	const std::string lsfg_status = LsfgStatusText();
 	const bool lsfg_line = !lsfg_status.empty() && (enabled_lines != 0 || LsfgStatusIsProblem());
 	enabled_lines |= static_cast<u32>(lsfg_line) << 12;
@@ -572,7 +576,7 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				s_speed_line.append_format("{}ARMSX2 " ARMSX2_IOS_OSD_VERSION " | Core: {}",
 					s_speed_line.empty() ? "" : " | ", BuildVersion::GitRev);
 #elif defined(__ANDROID__)
-				s_speed_line.append_format("{}ARMSX2 2.8", s_speed_line.empty() ? "" : " | ");
+				s_speed_line.append_format("{}ARMSX2 2.9", s_speed_line.empty() ? "" : " | ");
 #else
 				s_speed_line.append_format("{}PCSX2 {}", s_speed_line.empty() ? "" : " | ", BuildVersion::GitRev);
 #endif
@@ -688,10 +692,29 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				DRAW_LINE(osd_font, font_size, s_cpu_jit_line.c_str(), OsdTextColor());
 #endif
 
-				if (EmuConfig.Speedhacks.EECycleRate != 0 || EmuConfig.Speedhacks.EECycleSkip != 0)
+				// The governor's published word is the only governor state this thread reads.
+				// When it is not running the word says so and the configured settings answer.
+				const EECycleRateSampler::OverlayState ee_rate =
+					EECycleRateSampler::UnpackOverlayWord(EECycleRateSampler::GetOverlayWord());
+				const bool ee_rate_dynamic = ee_rate.enabled || ee_rate.shadow;
+
+				if (ee_rate_dynamic && ee_rate.effective != ee_rate.configured)
+				{
+					s_cpu_usage_ee_line.format("EE[{}->{}/{}]: ", ee_rate.configured, ee_rate.effective,
+						EmuConfig.Speedhacks.EECycleSkip);
+				}
+				else if (ee_rate_dynamic)
+				{
+					s_cpu_usage_ee_line.format("EE[{}~/{}]: ", ee_rate.configured, EmuConfig.Speedhacks.EECycleSkip);
+				}
+				else if (EmuConfig.Speedhacks.EECycleRate != 0 || EmuConfig.Speedhacks.EECycleSkip != 0)
+				{
 					s_cpu_usage_ee_line.format("EE[{}/{}]: ", EmuConfig.Speedhacks.EECycleRate, EmuConfig.Speedhacks.EECycleSkip);
+				}
 				else
+				{
 					s_cpu_usage_ee_line.assign("EE: ");
+				}
 				FormatProcessorStat(s_cpu_usage_ee_line, PerformanceMetrics::GetCPUThreadUsage(), PerformanceMetrics::GetCPUThreadAverageTime());
 				DRAW_LINE(osd_font, font_size, s_cpu_usage_ee_line.c_str(), OsdTextColor());
 
@@ -715,6 +738,24 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 					FormatProcessorStat(s_cpu_usage_vu_line, PerformanceMetrics::GetVUThreadUsage(), PerformanceMetrics::GetVUThreadAverageTime());
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_vu_line.c_str(), OsdTextColor());
 				}
+
+				// Only exists while the IOP runs on its own thread; the EE line above no longer includes
+				// its work then.
+				if (PerformanceMetrics::HasIOPThread())
+				{
+					s_cpu_usage_iop_line.assign("IOP: ");
+					FormatProcessorStat(s_cpu_usage_iop_line, PerformanceMetrics::GetIOPThreadUsage(), PerformanceMetrics::GetIOPThreadAverageTime());
+					DRAW_LINE(osd_font, font_size, s_cpu_usage_iop_line.c_str(), OsdTextColor());
+				}
+
+#if defined(PCSX2_DEVBUILD) || defined(PCSX2_DEBUG)
+				{
+					const std::string iop_stats = IopThread::OsdStatsLine();
+					s_iop_thread_line.assign(iop_stats.c_str());
+					if (!iop_stats.empty())
+						DRAW_LINE(osd_font, font_size, s_iop_thread_line.c_str(), OsdTextColor());
+				}
+#endif
 
 				const u32 gs_sw_threads = PerformanceMetrics::GetGSSWThreadCount();
 				for (u32 thread = 0; thread < gs_sw_threads; thread++)
@@ -816,6 +857,12 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_back_line.c_str(), OsdTextColor());
 				if (THREAD_VU1)
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_vu_line.c_str(), OsdTextColor());
+				if (PerformanceMetrics::HasIOPThread())
+					DRAW_LINE(osd_font, font_size, s_cpu_usage_iop_line.c_str(), OsdTextColor());
+#if defined(PCSX2_DEVBUILD) || defined(PCSX2_DEBUG)
+				if (!s_iop_thread_line.empty())
+					DRAW_LINE(osd_font, font_size, s_iop_thread_line.c_str(), OsdTextColor());
+#endif
 
 				const u32 thread_count = std::min(
 					PerformanceMetrics::GetGSSWThreadCount(),
@@ -1169,7 +1216,11 @@ __ri void ImGuiManager::DrawSettingsOverlay(float scale, float margin, float bot
 			Patch::GetActivePatchesCount(),
 			Patch::GetActiveCheatsCount());
 
-	if (EmuConfig.Speedhacks.EECycleRate != 0)
+	const EECycleRateSampler::OverlayState ee_rate =
+		EECycleRateSampler::UnpackOverlayWord(EECycleRateSampler::GetOverlayWord());
+	if (ee_rate.enabled || ee_rate.shadow)
+		APPEND("CR={}->{} ", ee_rate.configured, ee_rate.effective);
+	else if (EmuConfig.Speedhacks.EECycleRate != 0)
 		APPEND("CR={} ", EmuConfig.Speedhacks.EECycleRate);
 	if (EmuConfig.Speedhacks.EECycleSkip != 0)
 		APPEND("CS={} ", EmuConfig.Speedhacks.EECycleSkip);
@@ -2157,8 +2208,8 @@ void ImGuiManager::RenderOverlays()
 		SaveStateSelectorUI::Draw();
 }
 
-// An arcade light gun aimed with a stick has nothing on screen to show where it points (a finger on a
-// touchscreen, or a real gun, needs nothing): a crosshair per player, while that player's stick aims.
+// A light gun aimed with a stick has no on-screen pointer (a touchscreen or a real gun needs none):
+// draws a crosshair per player while that player's stick aims.
 void ImGuiManager::DrawArcadeGunCrosshairs(float scale)
 {
 	if (!Arcade::IsActive() || ACJV::GetMode() != JVS_MODE::LIGHTGUN)

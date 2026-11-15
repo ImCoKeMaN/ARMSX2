@@ -101,6 +101,9 @@ bool GSGetPresentCapRenderSkip();
 // a clean re-prime, no catch-up burst — as soon as fast-forward ends.
 void GSSetPresentCapSuspended(bool suspended);
 bool GSGetPresentCapSuspended();
+// The IPU decoded a picture (any thread). The display looks at the count to tell a movie is playing.
+void GSNoteVideoDecode();
+u32 GSGetVideoDecodeCount();
 int GSfreeze(FreezeAction mode, freezeData* data);
 std::string GSGetBaseSnapshotFilename();
 // False if there is no renderer, or a snapshot is already queued and this request was dropped.
@@ -108,6 +111,30 @@ bool GSQueueSnapshot(const std::string& path, u32 gsdump_frames = 0);
 // True while a dump is open and taking frames. Queueing a snapshot over one of these does not
 // start a second dump -- it overwrites the remaining frame count and cuts the recording short.
 bool GSIsDumpRecording();
+
+// Where the most recent GS dump request has got to. One request at a time: a new one starts over.
+enum class GSDumpPhase : u32
+{
+	Idle, // no request, or the renderer was closed before it was served
+	Queued, // accepted; the next VSync opens the dump
+	Recording, // open and taking frames
+	Packing, // every frame is recorded; the dump is closing (screenshot written, zip built)
+	Done, // closed; the zip is on disk unless packing failed
+};
+
+struct GSDumpStatus
+{
+	GSDumpPhase phase;
+	// GS vsyncs from the request to the one that opened the dump (1 = the very next one). 0 until it opened.
+	u32 vsyncs_to_open;
+	// GS vsyncs from the request to the last recorded one. 0 until the recording finished.
+	u32 vsyncs_to_recorded;
+};
+
+// Any thread. Two reads of the same recording can disagree about phase and counts only across a new
+// request, which resets both.
+GSDumpStatus GSGetDumpStatus();
+
 // True when the two-object split is live: a pipelined back thread with its own front parser.
 // Not the same question as the BackThreadMode setting, which downgrades to lockstep when the
 // split is unsupported, so this is the only way to tell whether the mode really engaged.
@@ -125,6 +152,11 @@ void GSSetPortraitRenderTopAlign(bool enabled);
 void GSSetPortraitRenderTopInset(int pixels);
 /// Top-align the render in a LANDSCAPE window (foldables / clamshell controllers).
 void GSSetLandscapeRenderTopAlign(bool enabled);
+/// Side-by-side VR for phone headsets: the frame drawn twice, once in each half of the window.
+/// [size_percent] sizes each picture within its half (30-100); [distance_percent] moves the two
+/// pictures apart (positive) or together (negative) across the room their halves leave (-100-100);
+/// [height_percent] moves both down (positive) or up (negative) the same way.
+void GSSetSideBySideVR(bool enabled, int size_percent, int distance_percent, int height_percent);
 bool GSHasDisplayWindow();
 void GSResizeDisplayWindow(u32 width, u32 height, float scale);
 void GSUpdateDisplayWindow();
@@ -132,6 +164,11 @@ void GSSetVSyncMode(GSVSyncMode mode, bool allow_present_throttle);
 
 GSRendererType GSGetCurrentRenderer();
 bool GSIsHardwareRenderer();
+
+/// The API of the GS device that is open now, None when there is none. Unlike GSGetCurrentRenderer(), which is the
+/// configured renderer and reads Auto after a reopen that was given the unresolved setting, this is what the
+/// device actually is. Safe to read from any thread.
+RenderAPI GSGetCurrentRenderAPI();
 
 /// Whether this renderer's GetOutput() reads the framebuffer at the display's own offset,
 /// block-aligning as it goes, rather than reading the whole buffer and leaving the offset

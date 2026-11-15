@@ -108,6 +108,7 @@ enum class ShaderInterlace
 	BLEND = 2,
 	MAD_BUFFER = 3,
 	MAD_RECONSTRUCT = 4,
+	COMB = 5,
 	Count
 };
 
@@ -577,6 +578,8 @@ static inline ShaderConvertSelector GetConvertShaderMask(const GSTexture* src, c
 	return GetConvertShaderMask(src->GetFormat(), dst->GetFormat(), src_bpp, dst_bpp, red, green, blue, alpha);
 }
 
+// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 enum ChannelFetch
 {
 	ChannelFetch_NONE  = 0,
@@ -601,6 +604,7 @@ enum class HWBlendType
 	BMIX1_SRC_HALF          = 2, // Impossible blend will always be wrong on hw, divide Cs by 2.
 	BMIX2_OVERFLOW          = 3, // Blending Cs might overflow, try to compensate.
 };
+// TFX pipeline key layout: end.
 
 struct alignas(16) DisplayConstantBuffer
 {
@@ -655,6 +659,8 @@ struct alignas(16) InterlaceConstantBuffer
 	// (two rows at 2x, one at 1x and at 1.5x). The weave and MAD buffering passes read the first row
 	// that WAS drawn instead of the hole; without it the frame carries a black row at 2x and above.
 	// (first undrawn device row, first drawn device row below it, unused, unused)
+	// The comb pass uses zw instead: (unused, unused, device rows per native line, device row where
+	// native line 0 starts).
 	GSVector4 FieldPad;
 };
 static_assert(sizeof(InterlaceConstantBuffer) == 32, "InterlaceConstantBuffer is correct size");
@@ -693,6 +699,8 @@ struct HWBlend
 
 struct alignas(16) GSHWDrawConfig
 {
+	// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+	// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 	enum class Topology: u8
 	{
 		Point,
@@ -979,6 +987,7 @@ struct alignas(16) GSHWDrawConfig
 	};
 	static_assert(sizeof(PSSelector) == 16, "PSSelector is 12 bytes");
 #pragma pack(pop)
+	// TFX pipeline key layout: end.
 	struct PSSelectorHash
 	{
 		std::size_t operator()(const PSSelector& p) const
@@ -1048,6 +1057,8 @@ struct alignas(16) GSHWDrawConfig
 			return (triln >= static_cast<u8>(GS_MIN_FILTER::Nearest_Mipmap_Nearest));
 		}
 	};
+	// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+	// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 	struct DepthStencilSelector
 	{
 		union
@@ -1099,6 +1110,7 @@ struct alignas(16) GSHWDrawConfig
 		constexpr ColorMaskSelector(): key(0xF) {}
 		constexpr ColorMaskSelector(u8 c): key(0) { wrgba = c; }
 	};
+	// TFX pipeline key layout: end.
 
 #pragma pack(pop)
 	struct alignas(16) VSConstantBuffer
@@ -1254,6 +1266,8 @@ struct alignas(16) GSHWDrawConfig
 		}
 	};
 	// For hardware rendering backends
+	// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+	// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 	struct BlendState
 	{
 		typedef u8 BlendOp; /*GSDevice::BlendOp*/
@@ -1292,6 +1306,7 @@ struct alignas(16) GSHWDrawConfig
 		// Blending has no effect if RGB is masked.
 		bool IsEffective(ColorMaskSelector colormask) const;
 	};
+	// TFX pipeline key layout: end.
 
 	enum class AlphaTestMode
 	{
@@ -1424,6 +1439,25 @@ struct alignas(16) GSHWDrawConfig
 	static_assert(sizeof(BlendMultiPass) == 8, "blend multi pass is 8 bytes");
 
 	BlendMultiPass blend_multi_pass;
+
+	/// Non-zero: draw this colclip draw at native resolution, dividing the target's size by this
+	/// scale, then resolve back with point sampling. Set only for +-1 counter draws, and only when
+	/// the device reports native_counter_draws. See GSRendererHW::IsColClipCounterDraw().
+	float colclip_native_scale;
+
+	/// A colour-wrap counter draw counted in the stencil buffer instead of the colour-clip copy (see
+	/// GSRendererHW::SetupStencilCounterDraw). The indices are sorted by the sign of the step: the
+	/// primitives before `minus_start` add +step to the written colour channels, the rest -step, and
+	/// primitives that add nothing are left out when nothing else of theirs is written. The backend
+	/// draws the two runs with stencil INCR_WRAP and DECR_WRAP (colour writes limited to alpha, which
+	/// the draw writes as usual), then adds step * count mod 256 into the RGB channels the colour mask
+	/// enables. Only set when the device reports stencil_counter.
+	struct StencilCounter
+	{
+		u32 minus_start; ///< First index of the -step primitives.
+		u8 step[3];      ///< The +step per RGB channel, in the target's 8-bit units (0x08 on a 16-bit target); 0 where unwritten.
+		bool enable;
+	} stencil_counter;
 
 	VSConstantBuffer cb_vs;
 	PSConstantBuffer cb_ps;
@@ -1604,7 +1638,11 @@ public:
 		bool dual_source_blend    : 1; ///< Supports a second fragment output (SRC1) as a hardware blend factor.
 		bool broken_mad_deinterlace : 1; ///< Driver can't reliably preserve/read the two-bank FastMAD history target.
 		bool broken_blend_constant : 1; ///< Driver applies a CONST_COLOR / INV_CONST_COLOR blend factor as if the constant were zero. A fixed (AFIX) factor rides the second fragment output instead -- see GSBlendConstantPolicy.h.
+		bool native_counter_draws : 1; ///< Can draw a fresh convert-and-resolve colclip draw at native resolution (GSHWDrawConfig::colclip_native_scale).
+		bool stencil_counter : 1; ///< Can count a colour-wrap counter draw in the stencil buffer and add the count into the target (GSHWDrawConfig::stencil_counter). Vulkan only: needs the stencil buffer and a sampled stencil aspect.
+		bool destination_alpha_loop : 1; ///< Copy road for self-reads, except a destination-alpha draw in the stencil-one mode, which reads the target in the pass under a declared feedback loop with one barrier instead of building its stencil in a setup pass. Vulkan only (Turnip on the Adreno 613); see GSSelfReadRoadPolicy.h.
 		GSFeedbackCarry feedback_carry; ///< Which draws may keep the open pass's feedback-loop bits. Vulkan only; see GSDrawRoad.h.
+		u8 sub_texel_precision_bits; ///< Fractional bits the sampler keeps of a texel coordinate (Vulkan's subTexelPrecisionBits), so how far it may round one. 0 = not known; read as Vulkan's minimum, 4.
 		FeatureSupport()
 		{
 			memset(this, 0, sizeof(*this));
@@ -1647,6 +1685,8 @@ public:
 	};
 	using RecycledTexture = std::unique_ptr<GSTexture, TextureRecycleDeleter>;
 
+	// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+	// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 	enum BlendFactor : u8
 	{
 		// HW blend factors
@@ -1660,10 +1700,14 @@ public:
 		// HW blend operations
 		OP_ADD, OP_SUBTRACT, OP_REV_SUBTRACT
 	};
+	// TFX pipeline key layout: end.
 	// clang-format on
 
 protected:
 	std::string m_name = "Unknown";
+	/// Why Create() failed, when the backend knows and has not reported it itself. GSopen adds it
+	/// to its "Failed to create render device" report.
+	std::string m_create_error;
 	FeatureSupport m_features;
 	u32 m_max_texture_size = 0;
 	// ★ Unknown, NOT Adreno. Defaulting to a real vendor meant every backend that never calls
@@ -1702,7 +1746,7 @@ private:
 	static const std::array<HWBlend, 3*3*3*3> m_blendMap;
 
 protected:
-	static constexpr int NUM_INTERLACE_SHADERS = 5;
+	static constexpr int NUM_INTERLACE_SHADERS = 6;
 	static constexpr float MAD_SENSITIVITY = 0.08f;
 	static constexpr u32 MAX_POOLED_TARGETS = 300;
 	static constexpr u32 MAX_TARGET_AGE = 20;
@@ -1868,6 +1912,9 @@ public:
 	/// Returns a string containing current adapter in use.
 	const std::string& GetName() const { return m_name; }
 
+	/// Why Create() failed, or empty. See m_create_error.
+	const std::string& GetCreateError() const { return m_create_error; }
+
 	GSTexture* GetColorClipTexture() const { return m_colclip_rt; }
 		
 	void SetColorClipTexture(GSTexture* tex) { m_colclip_rt = tex; }
@@ -1926,6 +1973,7 @@ public:
 	static int GetMipmapLevelsForSize(int width, int height);
 
 	__fi u64 GetPoolMemoryUsage() const { return m_pool_memory_usage; }
+	__fi u32 GetFrame() const { return m_frame; }
 
 	__fi FeatureSupport Features() const { return m_features; }
 	__fi u32 GetMaxTextureSize() const { return m_max_texture_size; }
@@ -1965,6 +2013,15 @@ public:
 	GSVector2i GetPresentationSize() const;
 	__fi s32 GetPresentationWidth() const { return GetPresentationSize().x; }
 	__fi s32 GetPresentationHeight() const { return GetPresentationSize().y; }
+
+	/// Rotation the swap chain images were created with because the surface asked for it (see
+	/// VKSwapChain::GetPreRotation). Invisible to layout: the window size stays in the window's
+	/// orientation, and only the final present into the swap chain image applies it.
+	virtual DisplayRotation GetSurfacePreRotation() const { return DisplayRotation::Rot0; }
+
+	/// The rotation the final present applies: the user's DisplayRotation followed by the surface
+	/// pre-rotation. Both are clockwise quarter turns, so they add.
+	DisplayRotation GetPresentRotation() const;
 	__fi float GetWindowScale() const { return m_window_info.surface_scale; }
 	__fi GSVSyncMode GetVSyncMode() const { return m_vsync_mode; }
 	__fi bool IsPresentThrottleAllowed() const { return m_allow_present_throttle; }
@@ -2053,14 +2110,15 @@ public:
 	/// Enables/disables GPU frame timing.
 	virtual bool SetGPUTimingEnabled(bool enabled) = 0;
 
-	/// Names the running game, so a device can build the pipelines it recorded for that game ahead
-	/// of their first use. Called on the GS thread when a renderer opens and on every game change;
-	/// an empty serial (the software renderer, or no game) means build nothing.
+	/// Names the running game, so a device can read the game's shader packs into RAM and build the
+	/// pipelines it recorded for that game ahead of their first use. Called on the GS thread when a
+	/// renderer opens and on every game change; an empty serial (the software renderer, or no game)
+	/// means no game.
 	virtual void SetGameIdentity(const std::string& serial, u32 crc) {}
 
-	/// Called on the GS thread just before the on-disk shader caches are cleared: close whatever
-	/// cache file the device holds outside GSCacheFile's stores, and drop in-memory state it would
-	/// otherwise write back.
+	/// Called on the GS thread just before the on-disk shader caches are cleared: drop in-memory
+	/// state the device would otherwise write back outside GSCacheFile's packs (which the clear
+	/// empties in place).
 	virtual void PrepareShaderCacheClear() {}
 
 	/// Returns the amount of GPU time utilized since the last time this method was called.
@@ -2253,7 +2311,10 @@ public:
 	/// `top_pad` is the device rows of the merge target that were not drawn for this field, because
 	/// the merge offset that field's picture down by a native line: they start where the circuit's
 	/// display rect starts, not necessarily at row 0.
-	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset, const GSFieldPadRows& top_pad);
+	/// line_rows and line_origin: device rows per native line and the device row native line 0 starts
+	/// at, for the comb pass (mode 4), which works in native lines.
+	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset, const GSFieldPadRows& top_pad,
+		float line_rows = 1.0f, float line_origin = 0.0f);
 	void FXAA();
 	void ShadeBoost();
 	/// Runs the configured RetroArch (.slangp) shader chain over m_current, after
@@ -2280,6 +2341,13 @@ public:
 	/// the point of having it: SGSR was designed for Adreno, FSR1's two passes were not.
 	void SGSRUpscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect,
 		bool edge_direction);
+
+	/// Remote play (GSRemotePlay.h), once per presented vsync, before the present opens. While remote
+	/// play runs: draws src's src_uv part into the stream's frame at area (x, y, width, height, as
+	/// fractions of the frame, black around it), or a black frame for a null src, and hands it over.
+	/// Otherwise: lets go of whatever an earlier capture allocated. A renderer that cannot capture
+	/// keeps this no-op and never sets GSRemotePlay::g_renderer_captures.
+	virtual void RemotePlayVSync(GSTexture* src, const GSVector4& src_uv, const GSVector4& area) {}
 
 	bool ResizeRenderTarget(GSTexture** t, int w, int h, bool preserve_contents, bool recycle);
 

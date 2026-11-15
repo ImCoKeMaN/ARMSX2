@@ -144,7 +144,10 @@ bool OboeAudioStream::onError(oboe::AudioStream* oboeStream, oboe::Result error)
 		Console.Error("(Oboe) Stream disconnected, reopening...");
 		Stop();
 		Close();
-		if (!Open() || !Start())
+		// Reopen, but a paused stream stays paused: the resume starts it. Starting it here would play
+		// silence for as long as the pause lasts, and SetPaused(true) would not pause it again since
+		// it already counts as paused.
+		if (!Open() || (!m_paused && !Start()))
 			Console.Error("(Oboe) Failed to reopen stream after disconnection.");
 		return true;
 	}
@@ -183,8 +186,16 @@ bool OboeAudioStream::Initialize(bool stretch_enabled)
 		oboe::PerformanceMode::LowLatency,
 		oboe::PerformanceMode::None,
 	};
+	// Recording compatible: start at None. LowLatency lets AAudio take Qualcomm's MMAP fast
+	// path, which writes past the mixer that AudioPlaybackCapture taps: the game is audible on
+	// the device and missing from a screen recording, with no error anywhere, and whether MMAP
+	// is granted varies per run. None keeps the stream on the mixer, which is capturable.
+	if (m_parameters.android_recording_compatible)
+		Console.WriteLn("(Oboe) Recording compatible: opening with performance mode None.");
 	for (const oboe::PerformanceMode mode : kModes)
 	{
+		if (mode == oboe::PerformanceMode::LowLatency && m_parameters.android_recording_compatible)
+			continue;
 		m_perf_mode = mode;
 		for (int attempt = 0; attempt < 2; attempt++)
 		{
@@ -265,6 +276,9 @@ bool OboeAudioStream::Start()
 	const std::lock_guard<std::recursive_mutex> guard(m_lock);
 	if (m_playing)
 		return true;
+	// No stream after a reopen whose Open() failed. The resume path below rebuilds it.
+	if (!m_stream)
+		return false;
 
 	Console.WriteLn("(Oboe) Starting stream...");
 	m_stop_requested.store(false, std::memory_order_release);
@@ -322,7 +336,14 @@ void OboeAudioStream::SetPaused(bool paused)
 		{
 			oboe::Result result = m_stream->requestPause();
 			if (result != oboe::Result::OK)
-				Console.Error("(Oboe) requestPause() failed: %d", result);
+			{
+				// Stop it instead: left running it plays silence and keeps the device awake. Start()
+				// restarts a stopped stream the same as a paused one.
+				Console.Error("(Oboe) requestPause() failed: %d, stopping instead", result);
+				result = m_stream->requestStop();
+				if (result != oboe::Result::OK)
+					Console.Error("(Oboe) requestStop() failed: %d", result);
+			}
 		}
 		// Mark not-playing even if requestPause() failed, so the paused/
 		// playing bookkeeping can't desync and strand a later resume.

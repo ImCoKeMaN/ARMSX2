@@ -99,7 +99,8 @@ fun AppNavigation() {
                 )
                 is AppRoute.MemoryCardManager ->
                     MemoryCardScreen(onBack = UiNavigator::home, game = destination.game)
-                AppRoute.SaveManager -> SaveManagerScreen(onBack = UiNavigator::home)
+                is AppRoute.SaveManager ->
+                    SaveManagerScreen(onBack = UiNavigator::home, focusSerial = destination.focusSerial)
                 AppRoute.ControllerManager -> ControllerManagerScreen(onBack = UiNavigator::home)
                 AppRoute.PatchManager -> PatchManagerScreen(onBack = UiNavigator::home)
                 AppRoute.TextureManager -> TextureManagerScreen(onBack = UiNavigator::home)
@@ -114,6 +115,7 @@ fun AppNavigation() {
                 // into the drawer — you were sent to a screen you had not come from.
                 AppRoute.News -> NewsScreen(onBack = UiNavigator::home)
                 AppRoute.Friends -> FriendsScreen(onBack = UiNavigator::home)
+                AppRoute.RemotePlay -> com.armsx2.remoteplay.RemotePlayScreen(onBack = UiNavigator::home)
                 AppRoute.About -> AboutScreen(onBack = UiNavigator::home)
             }
         }

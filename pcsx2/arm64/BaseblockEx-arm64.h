@@ -398,12 +398,56 @@ public:
 		blocks.erase(first, last + 1);
 	}
 
+	// Stamp the redirect stub over one block's entry (and repoint its resident
+	// back-edge) without erasing it from the array. Same protocol as Remove():
+	// the next dispatch of this startpc goes through JITCompile once the caller
+	// resets the LUT entry, and any link site still branching into the old code
+	// lands on the stub and re-dispatches. New() reuses the entry and retargets
+	// fnptr when it recompiles a startpc whose BASEBLOCKEX is still present,
+	// which is also the state recClear leaves the in-progress block in.
+	//
+	// Exists because erase() is a memmove of the array tail, O(live blocks) per
+	// removed block, which goes quadratic when a cycle-rate transition
+	// invalidates thousands of blocks at once.
+	__fi void Invalidate(int idx)
+	{
+		if (!jitcompile)
+			return;
+
+		const uptr site = blocks[idx].fnptr;
+		PatchAtomic(site, EncodeB(site, StaleDispatchTarget()));
+
+		if (blocks[idx].backedge_site)
+			PatchAtomic(blocks[idx].backedge_site,
+				EncodeB(blocks[idx].backedge_site, blocks[idx].backedge_stub));
+	}
+
 	__fi void Reset()
 	{
 		blocks.clear();
 		links.clear();
 		emitting_startpc = 0;
 		emitting_fnptr = 0;
+	}
+
+	// Number of registered blocks: the denominator for anything that walks or
+	// repairs every live block, such as a cycle-rate transition's cost.
+	__fi u32 size() const { return blocks.size(); }
+
+	// The block whose code holds host address `pc`, or null. A walk of the
+	// whole array, for the crash post-mortem (RecCrashReport-arm64.h): reads
+	// only, no locks, no allocation. The array belongs to the thread that
+	// compiles into it, and the post-mortem only looks here for a fault on
+	// that thread in this recompiler's code, so the array is not changing.
+	const BASEBLOCKEX* FindByHostPc(uptr pc) const
+	{
+		for (u32 i = 0; i < blocks.size(); i++)
+		{
+			const BASEBLOCKEX& b = blocks[i];
+			if (pc - b.fnptr < b.x86size)
+				return &b;
+		}
+		return nullptr;
 	}
 
 #ifdef PCSX2_RECOMPILER_TESTS

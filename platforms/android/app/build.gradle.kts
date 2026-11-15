@@ -46,6 +46,27 @@ val armsx2ApplicationId = providers.gradleProperty("armsx2.applicationId").orEls
 // label (see ci-nightly-dualcore.sh) so they install alongside the stable app instead of replacing
 // it; the updater reads CHANNEL to decide whether to follow nightly or stable releases.
 val armsx2Channel = providers.gradleProperty("armsx2.channel").orElse("stable")
+// The commit this APK is built from, baked into BuildConfig.GIT_COMMIT so a problem report can name
+// it without depending on the native driver report (which is empty when the core was built outside
+// a git checkout). -Parmsx2.commit wins: a build from a copied source tree with no .git
+// passes it, since git cannot be asked there. Otherwise it is the short hash of HEAD of the
+// checkout this build is in, or "" if there is none. Anything that is not a hex hash is dropped so
+// the value can never break the generated source.
+val armsx2GitCommit: Provider<String> = providers.gradleProperty("armsx2.commit").orElse(
+    providers.provider {
+        val repoRoot = rootDir.resolve("../..").canonicalFile
+        if (!repoRoot.resolve(".git").exists()) {
+            ""
+        } else {
+            runCatching {
+                providers.exec {
+                    commandLine("git", "-C", repoRoot.path, "rev-parse", "--short=10", "HEAD")
+                    isIgnoreExitValue = true
+                }.standardOutput.asText.get()
+            }.getOrDefault("")
+        }
+    },
+).map { raw -> raw.trim().takeIf { Regex("[0-9a-fA-F]{7,40}").matches(it) }?.lowercase() ?: "" }
 // Home-screen label. The nightly overrides this with @string/app_name_nightly so the two installs
 // are distinguishable; everything else keeps the localized default.
 val armsx2AppLabel = providers.gradleProperty("armsx2.appLabel").orElse("@string/app_name")
@@ -85,6 +106,17 @@ val generateSharedResources by tasks.registering(Sync::class) {
     into(layout.buildDirectory.dir("generated/sharedResources/resources"))
 }
 
+// The About screen's license texts. GPL.html and ThirdPartyLicenses.html are the files the desktop
+// About dialog opens; like the runtime resources above they are copied from bin/docs at build time,
+// so there is no second copy to drift. They land in assets/licenses beside android.html, the
+// Android app's own list, which is committed under src/main/assets/licenses.
+val generateLicenseDocs by tasks.registering(Sync::class) {
+    from(rootProject.layout.projectDirectory.dir("../../bin/docs")) {
+        include("GPL.html", "ThirdPartyLicenses.html")
+    }
+    into(layout.buildDirectory.dir("generated/licenseDocs/licenses"))
+}
+
 // AGP 9.2.1 rejects a Provider in assets.srcDir (the sourceSets block below uses a concrete path),
 // so wire the dependency bmd's Provider form would have carried implicitly. The generated assets
 // dir is consumed by several AGP tasks — asset merge AND lint's model/analyze passes — so declare
@@ -93,7 +125,7 @@ val generateSharedResources by tasks.registering(Sync::class) {
 tasks.matching { t ->
     t.name == "preBuild" || t.name.endsWith("Assets") || t.name.contains("Lint")
 }.configureEach {
-    dependsOn(generateSharedResources)
+    dependsOn(generateSharedResources, generateLicenseDocs)
 }
 
 // Private, optional Discord SDK location. Set by release CI; absent in every public clone.
@@ -118,6 +150,7 @@ android {
         // Which release stream this APK came from: "stable" or "nightly". Read by the in-app
         // updater instead of inferring it from versionCode magnitude.
         buildConfigField("String", "CHANNEL", "\"${armsx2Channel.get()}\"")
+        buildConfigField("String", "GIT_COMMIT", "\"${armsx2GitCommit.get()}\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
@@ -281,6 +314,7 @@ android {
         // `generateSharedResources.map { }` form throws "cannot add Provider instances"). The
         // task dependency that materialises this tree is wired via tasks.matching above.
         assets.srcDir(layout.buildDirectory.dir("generated/sharedResources").get().asFile)
+        assets.srcDir(layout.buildDirectory.dir("generated/licenseDocs").get().asFile)
     }
 
     compileOptions {
@@ -392,14 +426,12 @@ val checkNoWindowModals by tasks.registering {
 tasks.named("preBuild") { dependsOn(checkNoWindowModals) }
 
 dependencies {
-    // Discord Social SDK, staged by hand rather than consumed as an .aar. The .aar's manifest
-    // declares RECORD_AUDIO plus four foreground-service permissions and Bluetooth, all for its
-    // voice features, and the manifest merger would fold every one of them into ARMSX2 -- the Play
-    // listing would then show "Microphone" and need a data-safety declaration for a feature we do
-    // not ship. Taking the pieces we want means we inherit no permissions at all: the native lib
-    // lives in jniLibs, the headers under cpp/3rdparty/discord, and AuthenticationActivity is
-    // declared in our own manifest. libwebrtc is here because the SDK's audio classes reference it
-    // and would otherwise NoClassDefFoundError if any init path touches them.
+    // Discord Social SDK. Its .aar's manifest declares RECORD_AUDIO plus foreground-service and
+    // audio-settings permissions for its voice features, and the manifest merger folds them into
+    // ARMSX2. RECORD_AUDIO is ours as well now (the emulated PS2 microphone reads the device's
+    // microphone through Oboe), so AndroidManifest.xml keeps it and "Microphone" on the Play listing
+    // is accurate. The others are removed there with tools:node="remove", since we ship none of
+    // those features.
     // The .aar, not its unpacked pieces: this is what delivers the SDK's manifest entries, its
     // consumer proguard rules and its transitive dependencies. Reconstructing those by hand cost
     // three separate bugs (boot crash, missing <queries>, missing androidx.browser).
@@ -435,6 +467,9 @@ dependencies {
     implementation(libs.coil.gif) // animated GIF / WebP / APNG (library background)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
+
+    // Remote play (com.armsx2.remoteplay): video, audio and player 2's input between two devices.
+    implementation(libs.streamWebrtc)
 
     testImplementation(libs.junit)
     // Real org.json for JVM unit tests: the mockable android.jar stubs throw "not mocked", and

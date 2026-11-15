@@ -3,6 +3,7 @@
 
 #include "SIO/Memcard/MemoryCardFile.h"
 
+#include "SIO/Memcard/MemcardBackup.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
 #include "SIO/Sio.h"
 #include <SIO/SioTypes.h>
@@ -20,6 +21,7 @@
 
 #include "Config.h"
 #include "Host.h"
+#include "IopThread/OwnerAsserts.h"
 #include "VMManager.h"
 #include "IconsPromptFont.h"
 
@@ -513,7 +515,7 @@ s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
 		}
 
 		// Once per write, not once per byte: a game writing over unerased pages (Soul Calibur II
-		// rebuilding its Conquest card, before m_overwrite) logged thousands of lines a second.
+		// rebuilding its Conquest card, before m_overwrite) would log thousands of lines a second.
 		int uncleared = 0;
 		for (int i = 0; i < size; i++)
 		{
@@ -694,15 +696,19 @@ void FileMcd_Flush()
 
 void FileMcd_CancelEject()
 {
+	// Clears the eject ticks the IOP's SIO2 code counts down.
+	IOP_SIDE_ASSERT();
 	AutoEject::ClearAll();
 }
 
 void FileMcd_Reopen(std::string new_serial)
 {
+	IOP_SIDE_ASSERT();
 	Console.WriteLn("Reopening memory cards...");
 	FileMcd_EmuClose();
 	FileMcd_SetType();
 	sioSetGameSerial(new_serial);
+	MemcardBackup::OnCardsReopening(); // snapshot while no card is open
 	FileMcd_EmuOpen();
 }
 
@@ -723,6 +729,7 @@ bool FileMcd_IsAutoEjecting()
 
 void FileMcd_Swap()
 {
+	IOP_SIDE_ASSERT();
 	if (MemcardBusy::IsBusy())
 	{
 		Host::AddIconOSDMessage("MemoryCardSwap_Busy", ICON_PF_MEMORY_CARD, TRANSLATE_SV("MemoryCardSwap_Busy", "Memory cards are busy. Can't swap right now."));

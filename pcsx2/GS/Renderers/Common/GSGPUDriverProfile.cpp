@@ -327,6 +327,51 @@ static u32 ParseFixGeneration(std::string_view driver_info)
 	return 0;
 }
 
+// The Adreno 7xx parts on which Turnip takes the declared feedback loop with our per-draw barriers
+// kept (MobileDriverProfile::prefers_declared_loop_with_barriers): the 730 and up, and the 722.
+//
+// Only the 740 and the 722 have been run. The 730 and 750 are in as the 740's neighbours in Mesa's
+// freedreno table. The 722 (Snapdragon 7 Gen 4) is an a7xx generation 1 part derived from the 730, and
+// Turnip runs it through the same CHIP == A7XX paths as the 740. A pass that declares the loop is not
+// tiled, so the 722's smaller GMEM does not enter those draws. The road this rule replaces, the
+// render-target copy, draws primitives that overlap within one draw wrong on any part.
+//
+// Not in the list: the 702, which Mesa's freedreno table files as an a6xx-family part, and the 710,
+// 720 and 725. None have been run.
+static constexpr bool PrefersDeclaredLoopOnA7xx(u16 model)
+{
+	return model >= 730 || model == 722;
+}
+
+// The Adreno 6xx parts on which Turnip takes the barrier-kept declared loop for the destination-alpha
+// draws only (MobileDriverProfile::prefers_declared_loop_for_destination_alpha). Only the 613 (RG 55G1)
+// has been run. On the render-target copy road a destination-alpha draw that cannot ride a barrier
+// builds its stencil from the target in a pass of its own, so every such draw ends the pass twice:
+// Stuntman issues about 1,070 a frame, 2,170 passes against 18 with the loop. The loop for every
+// self-read (the a7xx preference) rendered Black, OutRun, Katamari and Shadow of the Colossus
+// differently from run to run on this part, with the barriers kept; the copy road was stable.
+//
+// Not in the list: the 610 and the other parts below 650, which have not been run on this road, and the
+// 650 and up, which take the ordering fact with a tagged build and the copy road without one.
+static constexpr bool PrefersDestinationAlphaLoopOnA6xx(u16 model)
+{
+	return model == 613;
+}
+
+// The Adreno 7xx parts on which a generation-2 Turnip build is trusted to order the declared loop
+// with no barrier from us (MobileDriverProfile::orders_declared_feedback_loop): the 730 and up. The
+// 722 is NOT in this list, although it is in the one above.
+//
+// On the 722, with our barriers dropped and the driver's ordering trusted, NASCAR Thunder 2002 and
+// Splashdown render differently from the barrier-kept frames and differently from run to run. With the
+// barriers kept the frames are stable. It reproduced on two driver builds, so it is the part and not one
+// build; the cause is not known. The 722 therefore keeps our barriers under a generation-2 tag. The
+// Adreno 610 behaved the same under the generation-1 build, hence the 650 bound on that claim.
+static constexpr bool TrustsGeneration2OrderingOnA7xx(u16 model)
+{
+	return model >= 730;
+}
+
 static MobileGpuDriver DetectDriver(const GpuProfileSelection& selection,
 	const MobileDriverContext& context, std::string_view lowered_hints)
 {
@@ -429,7 +474,7 @@ static bool IsExemptForMaliSX2(const DriverRule& rule, const MobileDriverContext
 // Sources and upstream revisions are mirrored in docs/gpu-driver-database.json. A known bug is
 // not automatically an active workaround: expensive fallbacks stay off until they have a bounded,
 // tested condition.
-static constexpr std::array<DriverRule, 35> s_driver_rules = {{
+static constexpr std::array<DriverRule, 36> s_driver_rules = {{
 	{"gl-arm-buffer-stream", MobileGpuApi::OpenGL, RuntimeGpuProfile::Mali,
 		MobileGpuDriver::ArmProprietary, MobileGpuArchitecture::Unknown, 0, 0, 0, {}, {}, 0, 0, false,
 		Bug(DriverBug::BrokenBufferStreaming) | Bug(DriverBug::BrokenUnsynchronizedMapping) |
@@ -485,6 +530,11 @@ static constexpr std::array<DriverRule, 35> s_driver_rules = {{
 		Workaround(DriverWorkaround::UseDescriptorSets) |
 			Workaround(DriverWorkaround::DisableAttachmentFeedbackLoopLayout) |
 			Workaround(DriverWorkaround::ScalarizeVectorBitwiseAnd)},
+	// Arm's Mali driver before r30 segfaults compiling any pipeline that queries an image size.
+	{"vk-arm-image-query-before-r30", MobileGpuApi::Vulkan, RuntimeGpuProfile::Mali,
+		MobileGpuDriver::ArmProprietary, MobileGpuArchitecture::Unknown, 0, 0, 0, {}, {30, 0, 0},
+		0, 0, false, Bug(DriverBug::BrokenImageQuery),
+		Workaround(DriverWorkaround::PassTextureSizeInUniform)},
 	// Slow cached readback (from Dolphin's BUG_SLOW_CACHED_READBACK_MEMORY) measured backwards on
 	// r44p1 / Mali-G615: a non-coherent cached type with explicit invalidates beat the coherent
 	// map about 12x per readback. That does not prove it wrong on older parts, so the preference
@@ -547,7 +597,7 @@ static constexpr std::array<DriverRule, 35> s_driver_rules = {{
 	// a user on another MediaTek part lift it. MT6897 is exempt: measured, and the read is correct.
 	//
 	// Both ROAA rows describe Arm's blob. malisx2 is exempt from them once it advertises the access
-	// itself; a malisx2 pack that does not keeps the rows, so it gets the barrier road as before.
+	// itself; a malisx2 pack that does not keeps the rows and gets the barrier road.
 	{"vk-mediatek-mali-roaa-destination-read", MobileGpuApi::Vulkan, RuntimeGpuProfile::Mali,
 		MobileGpuDriver::Unknown, MobileGpuArchitecture::Unknown, 0, 0, 0, {}, {}, 0, 0, false,
 		Bug(DriverBug::BrokenRoaaDestinationRead), 0, true, MEASURED_SOC_MT6897, nullptr,
@@ -688,8 +738,9 @@ MobileDriverProfile ResolveDriverProfile(const GpuProfileSelection& selection,
 	// is trusted on Adreno 6xx at 650 and up; on Adreno 610 the declared road renders inconsistently
 	// run to run while the copy road is stable, so parts below 650 keep their barriers and copy
 	// road. Generation 2 adds the A7XX half (the per-overlap prim mode and the per-draw flush for a
-	// declared loop), measured on the Adreno 740; it is trusted on Adreno 730 and up, the range the
-	// a7xx road preference below already covers. A Qualcomm driver cannot carry a Mesa git tag.
+	// declared loop) and is trusted on the parts TrustsGeneration2OrderingOnA7xx names, the 730 and
+	// up. The 722 is on the a7xx road preference below but not here: without our barriers it renders
+	// unstably. A Qualcomm driver cannot carry a Mesa git tag.
 	profile.declared_loop_fix_generation = ParseFixGeneration(context.driver_info);
 	const bool tagged_turnip_vk = (context.api == MobileGpuApi::Vulkan) && (profile.driver == MobileGpuDriver::MesaTurnip);
 	const bool a6xx_fix = (profile.declared_loop_fix_generation >= 1) &&
@@ -697,7 +748,7 @@ MobileDriverProfile ResolveDriverProfile(const GpuProfileSelection& selection,
 		                  (selection.gpu.model_number >= 650);
 	const bool a7xx_fix = (profile.declared_loop_fix_generation >= 2) &&
 		                  (selection.gpu.architecture == MobileGpuArchitecture::Adreno7xx) &&
-		                  (selection.gpu.model_number >= 730);
+		                  TrustsGeneration2OrderingOnA7xx(selection.gpu.model_number);
 	profile.orders_declared_feedback_loop = tagged_turnip_vk && (a6xx_fix || a7xx_fix);
 	// The a7xx half orders a draw against earlier draws; within a draw it orders overlapping
 	// primitives only for a pipeline that requests rasterization-order access.
@@ -705,13 +756,17 @@ MobileDriverProfile ResolveDriverProfile(const GpuProfileSelection& selection,
 
 	// The a7xx preference is about the part, not the build, so it needs no tag: on Adreno 740 the
 	// declared loop with our barriers is correct and stable where the copy road renders wrong.
-	// Limited to 730-750: the 740 was measured, the 730 and 750 are the neighbouring a7xx
-	// generations in Mesa's freedreno table. 702-725 were never run (Mesa treats the 702 as a6xx
-	// family), so they keep the copy road.
+	// Limited to the parts PrefersDeclaredLoopOnA7xx names: the 740 and 722 have been run, and the 730
+	// and 750 are in as the 740's neighbours. The other 7xx parts have not been run (Mesa treats the
+	// 702 as a6xx family), so they keep the copy road.
 	profile.prefers_declared_loop_with_barriers = (context.api == MobileGpuApi::Vulkan) &&
 		                                          (profile.driver == MobileGpuDriver::MesaTurnip) &&
 		                                          (selection.gpu.architecture == MobileGpuArchitecture::Adreno7xx) &&
-		                                          (selection.gpu.model_number >= 730);
+		                                          PrefersDeclaredLoopOnA7xx(selection.gpu.model_number);
+	profile.prefers_declared_loop_for_destination_alpha =
+		(context.api == MobileGpuApi::Vulkan) && (profile.driver == MobileGpuDriver::MesaTurnip) &&
+		(selection.gpu.architecture == MobileGpuArchitecture::Adreno6xx) &&
+		PrefersDestinationAlphaLoopOnA6xx(selection.gpu.model_number);
 
 	for (size_t row = 0; row < s_driver_rules.size(); row++)
 	{
@@ -804,6 +859,7 @@ VulkanDeviceRules GpuProfileDetector::ResolveVulkanDeviceRules(const GpuProfileS
 	const bool qualcomm_driver = (context.driver_id == DRIVER_ID_QUALCOMM_PROPRIETARY);
 	const bool turnip = (context.driver_id == DRIVER_ID_MESA_TURNIP);
 	const bool honeykrisp = (context.driver_id == DRIVER_ID_MESA_HONEYKRISP);
+	const bool panvk = (context.driver_id == DRIVER_ID_MESA_PANVK);
 	const auto name_has = [device_name](std::string_view part) {
 		return device_name.find(part) != std::string_view::npos;
 	};
@@ -813,15 +869,21 @@ VulkanDeviceRules GpuProfileDetector::ResolveVulkanDeviceRules(const GpuProfileS
 	// Matched on the driverInfo string, not the parsed revision the rule table uses, and without the
 	// table's MT6897 exemption. MT6897's r44p1 does not advertise the layout extension, so the two
 	// agree on every r44p1 device seen.
+	//
+	// Imagination's driver: the database row vk-powervr-proprietary declares
+	// DisableAttachmentFeedbackLoopLayout, and this is the switch that makes it take effect. Keyed on
+	// the driver ID, so Mesa's PowerVR driver is left alone.
+	const bool imagination_proprietary =
+		(context.vendor_id == GpuVendorID::Imagination) && (context.driver_id == DRIVER_ID_IMAGINATION_PROPRIETARY);
 	rules.avoid_feedback_loop_layout =
-		mali && context.driver_info.find("r44p1") != std::string_view::npos;
+		(mali && context.driver_info.find("r44p1") != std::string_view::npos) || imagination_proprietary;
 	// The Mali crash is in Arm's blob. malisx2 reports Arm's identity but is our own driver, and is
 	// trusted with push descriptors once it advertises as many as the backend binds; a build without
-	// the extension, or with fewer, keeps the avoid.
+	// the extension, or with fewer, keeps the avoid. PanVK isn't the blob, so it keeps push descriptors.
 	rules.exempt_malisx2_push_descriptors = mali && GpuProfileDetector::IsMaliSX2Driver(context.driver_info) &&
 	                                        context.max_push_descriptors >= VULKAN_PUSH_DESCRIPTORS_REQUIRED;
-	rules.avoid_push_descriptors =
-		(mali && !rules.exempt_malisx2_push_descriptors) || (adreno && !qualcomm_driver && !turnip);
+	rules.avoid_push_descriptors = (mali && !panvk && !rules.exempt_malisx2_push_descriptors) ||
+	                               (adreno && !qualcomm_driver && !turnip);
 	rules.broken_provoking_vertex = adreno && qualcomm_driver;
 	rules.broken_colormask_with_depth =
 		adreno && !turnip && (context.device_id < 0x06000000u || context.driver_version < 0x801EA000u);
@@ -830,5 +892,8 @@ VulkanDeviceRules GpuProfileDetector::ResolveVulkanDeviceRules(const GpuProfileS
 		adreno && qualcomm_driver && selection.gpu.architecture == MobileGpuArchitecture::Adreno8xx;
 	rules.self_read_costs_measured = turnip || honeykrisp;
 	rules.barrier_road_measured = honeykrisp;
+	// The in-tile read without the extension, on the same driver the layout avoid names above. Both
+	// are needed: the ordering holds for subpassLoad, not for a sampler read of the attachment.
+	rules.ordered_input_attachment_read = imagination_proprietary && rules.avoid_feedback_loop_layout;
 	return rules;
 }

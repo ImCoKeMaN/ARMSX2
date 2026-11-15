@@ -9,6 +9,8 @@
 #include "common/HostSys.h"
 #include "common/Timer.h"
 
+#include <algorithm>
+
 #ifdef __APPLE__
 #include "common/Darwin/DarwinMisc.h"
 #endif
@@ -163,6 +165,7 @@ u8* armStartBlock()
 	// every displacement computed from it remain in execute space.
 	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(
 		static_cast<vixl::byte*>(armGetWritableCodePtr(armAsmPtr)), armAsmCapacity);
+	armAsm->SetCPUFeatures(armBaselineCPUFeatures());
 	armAsm->GetScratchVRegisterList()->Remove(31);
 	armAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
 	return armAsmPtr;
@@ -228,6 +231,87 @@ void armPatchCodeWord(void* site, u32 instr)
 		HostSys::EndCodeWriteRange(rx_site, sizeof(u32));
 }
 
+// Granule for the cache-maintenance ops, from CTR_EL0: the smaller of IminLine
+// (bits 3:0) and DminLine (bits 19:16), each log2 of a count of 4-byte words.
+// The smaller one lets a single address list serve both the D and I loops; a
+// granule finer than the real line only issues a redundant CMO. This is not
+// HostSys::GetRuntimeCacheLineSize(), which reports the largest data line for
+// false-sharing padding; using that here would skip lines.
+//
+// Darwin: XNU does not expose CTR_EL0 to EL0, so the read is an illegal
+// instruction. The Darwin flusher only builds ranges for sys_icache_invalidate,
+// so any granule covering the patched word works; 64 is the smallest line an
+// Apple core has shipped with.
+static size_t armCodePatchGranule()
+{
+#ifdef __APPLE__
+	return 64;
+#else
+	static const size_t granule = []() -> size_t {
+		u64 ctr = 0;
+		__asm__ __volatile__("mrs %0, ctr_el0" : "=r"(ctr));
+		const size_t dline = static_cast<size_t>(4) << ((ctr >> 16) & 0xf);
+		const size_t iline = static_cast<size_t>(4) << (ctr & 0xf);
+		return std::min(dline, iline);
+	}();
+	return granule;
+#endif
+}
+
+void ArmCodePatchFlusher::Note(const void* site)
+{
+	const uintptr_t line = reinterpret_cast<uintptr_t>(site) & ~(armCodePatchGranule() - 1);
+	// Sites arrive in increasing code order within an arena, and the ones a
+	// single block emits sit a few instructions apart, so checking only the
+	// previous entry collapses most of the repeats. A duplicate that slips
+	// through costs one redundant CMO pair, not correctness.
+	if (!m_lines.empty() && m_lines.back() == line)
+		return;
+	m_lines.push_back(line);
+}
+
+void ArmCodePatchFlusher::Finish()
+{
+	if (m_lines.empty())
+		return;
+
+#ifdef __APPLE__
+	// sys_icache_invalidate (via HostSys::FlushInstructionCache) is the only
+	// interface that stays correct under iOS dual-map and Legacy W^X, so touched
+	// lines are coalesced into runs, one call per run. A run also invalidates
+	// the gaps inside it, hence the page-sized gap cap.
+	std::sort(m_lines.begin(), m_lines.end());
+	const size_t granule = armCodePatchGranule();
+	constexpr uintptr_t kMaxGap = 4096;
+
+	uintptr_t lo = m_lines[0];
+	uintptr_t hi = m_lines[0] + granule;
+	for (size_t i = 1; i < m_lines.size(); i++)
+	{
+		if (m_lines[i] - hi <= kMaxGap)
+		{
+			hi = m_lines[i] + granule;
+			continue;
+		}
+		HostSys::FlushInstructionCache(reinterpret_cast<void*>(lo), static_cast<u32>(hi - lo));
+		lo = m_lines[i];
+		hi = m_lines[i] + granule;
+	}
+	HostSys::FlushInstructionCache(reinterpret_cast<void*>(lo), static_cast<u32>(hi - lo));
+#else
+	// The `dsb ish` between the two loops is required: the clean has to
+	// complete before the invalidate.
+	for (const uintptr_t line : m_lines)
+		__asm__ __volatile__("dc cvau, %0" : : "r"(line) : "memory");
+	__asm__ __volatile__("dsb ish" : : : "memory");
+	for (const uintptr_t line : m_lines)
+		__asm__ __volatile__("ic ivau, %0" : : "r"(line) : "memory");
+	__asm__ __volatile__("dsb ish\n\tisb" : : : "memory");
+#endif
+
+	m_lines.clear();
+}
+
 void armDisassembleAndDumpCode(const void* ptr, size_t size)
 {
 #ifdef INCLUDE_DISASSEMBLER
@@ -248,6 +332,42 @@ void armDisassembleAndDumpCode(const void* ptr, size_t size)
 #endif
 }
 
+u32 armMovRunWidth(u64 value)
+{
+	u32 width = 1;
+	for (u32 hw = 1; hw < 4; hw++)
+	{
+		if ((value >> (16 * hw)) & 0xFFFFu)
+			width = hw + 1;
+	}
+	return width;
+}
+
+void armEmitMovRun(const vixl::aarch64::Register& reg, u64 value, u32 width)
+{
+	pxAssert(reg.IsX() && width >= 1 && width <= 4);
+	pxAssert(width == 4 || (value >> (16 * width)) == 0);
+	vixl::ExactAssemblyScope guard(armAsm, width * 4);
+	armAsm->movz(reg, value & 0xFFFF, 0);
+	for (u32 hw = 1; hw < width; hw++)
+		armAsm->movk(reg, (value >> (16 * hw)) & 0xFFFF, 16 * hw);
+}
+
+// Recorder path for an address materialized as an immediate. Returns false
+// when the recorder cannot relocate it (it has then failed the episode) and
+// the caller should emit its default form.
+static bool armEmitRecordedMovRun(const vixl::aarch64::Register& reg, const void* addr)
+{
+	const ArmAddressRecorder::AddressClass c = armAddressRecorder->ClassifyAddress(addr);
+	if (!c.relocatable)
+		return false;
+	const u64 v = reinterpret_cast<uintptr_t>(addr);
+	const u32 width = std::max(c.minMovWidth, armMovRunWidth(v));
+	armEmitMovRun(reg, v, width);
+	armAddressRecorder->OnMovRun(armGetCurrentCodePointer() - width * 4, width, addr);
+	return true;
+}
+
 void armEmitJmp(const void* ptr, bool force_inline)
 {
 	s64 displacement = GetPCDisplacement(armGetCurrentCodePointer(), ptr);
@@ -263,9 +383,8 @@ void armEmitJmp(const void* ptr, bool force_inline)
 
 	if (use_blr)
 	{
-		if (armAddressRecorder)
-			armAddressRecorder->OnAbsoluteTarget(ptr);
-		armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr));
+		if (!armAddressRecorder || !armEmitRecordedMovRun(RXVIXLSCRATCH, ptr))
+			armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr));
 		armAsm->Br(RXVIXLSCRATCH);
 	}
 	else
@@ -277,7 +396,7 @@ void armEmitJmp(const void* ptr, bool force_inline)
 		// Record after emission: the scope entry may flush a pending vixl
 		// literal pool, so the insn address is only known once it's out.
 		if (armAddressRecorder)
-			armAddressRecorder->OnDirectBranch(armGetCurrentCodePointer() - 4, ptr, false);
+			armAddressRecorder->OnBranch(armGetCurrentCodePointer() - 4, ptr, ArmAddressRecorder::BranchForm::Rel26);
 	}
 }
 
@@ -311,9 +430,8 @@ void armEmitCall(const void* ptr, bool force_inline)
 
 	if (use_blr)
 	{
-		if (armAddressRecorder)
-			armAddressRecorder->OnAbsoluteTarget(ptr);
-		armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr));
+		if (!armAddressRecorder || !armEmitRecordedMovRun(RXVIXLSCRATCH, ptr))
+			armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr));
 		armAsm->Blr(RXVIXLSCRATCH);
 	}
 	else
@@ -323,7 +441,7 @@ void armEmitCall(const void* ptr, bool force_inline)
 			armAsm->bl(displacement);
 		}
 		if (armAddressRecorder)
-			armAddressRecorder->OnDirectBranch(armGetCurrentCodePointer() - 4, ptr, true);
+			armAddressRecorder->OnBranch(armGetCurrentCodePointer() - 4, ptr, ArmAddressRecorder::BranchForm::Rel26);
 	}
 }
 
@@ -334,8 +452,12 @@ void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr)
 	//pxAssert(Common::IsAligned(jump_distance, 4));
 	if (a64::Instruction::IsValidImmPCOffset(a64::CompareBranchType, jump_distance >> 2))
 	{
-		a64::SingleEmissionCheckScope guard(armAsm);
-		armAsm->cbnz(reg, jump_distance >> 2);
+		{
+			a64::SingleEmissionCheckScope guard(armAsm);
+			armAsm->cbnz(reg, jump_distance >> 2);
+		}
+		if (armAddressRecorder)
+			armAddressRecorder->OnBranch(armGetCurrentCodePointer() - 4, ptr, ArmAddressRecorder::BranchForm::Rel19);
 	}
 	else
 	{
@@ -346,6 +468,8 @@ void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr)
 		const s64 new_jump_distance =
 			static_cast<s64>(reinterpret_cast<intptr_t>(ptr) - reinterpret_cast<intptr_t>(armGetCurrentCodePointer()));
 		armAsm->b(new_jump_distance >> 2);
+		if (armAddressRecorder)
+			armAddressRecorder->OnBranch(armGetCurrentCodePointer() - 4, ptr, ArmAddressRecorder::BranchForm::Rel26);
 		armAsm->bind(&branch_not_taken);
 	}
 }
@@ -356,27 +480,16 @@ void armEmitCondBranch(a64::Condition cond, const void* ptr)
 		static_cast<s64>(reinterpret_cast<intptr_t>(ptr) - reinterpret_cast<intptr_t>(armGetCurrentCodePointer()));
 	//pxAssert(Common::IsAligned(jump_distance, 4));
 
-	// A recorder patching this branch on relocation needs the imm26 reach of a
-	// plain B — B.cond's ±1MB imm19 may not survive the move. Force the long
-	// form for targets the recorder marks relocatable and record the B.
-	if (armAddressRecorder && armAddressRecorder->WantsLongCondBranch(ptr))
-	{
-		a64::MacroEmissionCheckScope guard(armAsm);
-		a64::Label branch_not_taken;
-		armAsm->b(&branch_not_taken, a64::InvertCondition(cond));
-
-		const s64 new_jump_distance =
-			static_cast<s64>(reinterpret_cast<intptr_t>(ptr) - reinterpret_cast<intptr_t>(armGetCurrentCodePointer()));
-		armAsm->b(new_jump_distance >> 2);
-		armAddressRecorder->OnDirectBranch(armGetCurrentCodePointer() - 4, ptr, false);
-		armAsm->bind(&branch_not_taken);
-		return;
-	}
-
+	// A recorded B.cond keeps its short form: the recorder logs it and the
+	// hydrator re-checks the ±1MB reach at the new placement.
 	if (a64::Instruction::IsValidImmPCOffset(a64::CondBranchType, jump_distance >> 2))
 	{
-		a64::SingleEmissionCheckScope guard(armAsm);
-		armAsm->b(jump_distance >> 2, cond);
+		{
+			a64::SingleEmissionCheckScope guard(armAsm);
+			armAsm->b(jump_distance >> 2, cond);
+		}
+		if (armAddressRecorder)
+			armAddressRecorder->OnBranch(armGetCurrentCodePointer() - 4, ptr, ArmAddressRecorder::BranchForm::Rel19);
 	}
 	else
 	{
@@ -387,6 +500,8 @@ void armEmitCondBranch(a64::Condition cond, const void* ptr)
 		const s64 new_jump_distance =
 			static_cast<s64>(reinterpret_cast<intptr_t>(ptr) - reinterpret_cast<intptr_t>(armGetCurrentCodePointer()));
 		armAsm->b(new_jump_distance >> 2);
+		if (armAddressRecorder)
+			armAddressRecorder->OnBranch(armGetCurrentCodePointer() - 4, ptr, ArmAddressRecorder::BranchForm::Rel26);
 		armAsm->bind(&branch_not_taken);
 	}
 }
@@ -396,21 +511,16 @@ void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr)
 	// psxAsm->Mov(reg, static_cast<u64>(reinterpret_cast<uintptr_t>(addr)));
 	pxAssert(reg.IsX());
 
-	if (armAddressRecorder &&
-		armAddressRecorder->ClassifyMove(addr) == ArmAddressRecorder::MoveForm::CanonicalAbs)
+	// A recorded address that ADRP may not carry (a heap object: its low 12
+	// bits move too) goes straight to the patchable MOVZ/MOVK run.
+	if (armAddressRecorder)
 	{
-		// Fixed-width 16-byte form: every operand bit lives in a movz/movk
-		// imm16 field a relocation patcher can rewrite in place.
-		const u64 v = reinterpret_cast<uintptr_t>(addr);
+		const ArmAddressRecorder::AddressClass c = armAddressRecorder->ClassifyAddress(addr);
+		if (c.relocatable && !c.allowAdrp)
 		{
-			vixl::ExactAssemblyScope guard(armAsm, 16);
-			armAsm->movz(reg, v & 0xFFFF, 0);
-			armAsm->movk(reg, (v >> 16) & 0xFFFF, 16);
-			armAsm->movk(reg, (v >> 32) & 0xFFFF, 32);
-			armAsm->movk(reg, (v >> 48) & 0xFFFF, 48);
+			armEmitRecordedMovRun(reg, addr);
+			return;
 		}
-		armAddressRecorder->OnCanonicalAbsMove(armGetCurrentCodePointer() - 16, addr);
-		return;
 	}
 
 	const void* current_code_ptr_page = reinterpret_cast<const void*>(
@@ -427,7 +537,12 @@ void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr)
 		}
 		if (armAddressRecorder)
 			armAddressRecorder->OnAdrp(armGetCurrentCodePointer() - 4, addr);
-		armAsm->Add(reg, reg, page_offset);
+		// Always emit the add, even for page-aligned addresses: a lone ADRP followed by a load or store through
+		// it can hit Cortex-A53 erratum 843419, and the linker fix doesn't cover JIT code.
+		{
+			a64::SingleEmissionCheckScope guard(armAsm);
+			armAsm->add(reg, reg, page_offset);
+		}
 	}
 	else if (vixl::IsInt21(page_displacement) && a64::Assembler::IsImmLogical(page_offset, 64))
 	{
@@ -441,9 +556,8 @@ void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr)
 	}
 	else
 	{
-		if (armAddressRecorder)
-			armAddressRecorder->OnAbsoluteTarget(addr);
-		armAsm->Mov(reg, reinterpret_cast<uintptr_t>(addr));
+		if (!armAddressRecorder || !armEmitRecordedMovRun(reg, addr))
+			armAsm->Mov(reg, reinterpret_cast<uintptr_t>(addr));
 	}
 }
 
@@ -586,6 +700,7 @@ u8* ArmConstantPool::GetJumpTrampoline(const void* target)
 	HostSys::BeginCodeWriteRange(trampoline_ptr, TRAMPOLINE_WRITE_WINDOW);
 	// Emit into the RW alias; trampoline_ptr (RX) is what callers branch to.
 	a64::MacroAssembler masm(static_cast<vixl::byte*>(armGetWritableCodePtr(trampoline_ptr)), m_capacity - offset);
+	masm.SetCPUFeatures(armBaselineCPUFeatures());
 	masm.Mov(RXVIXLSCRATCH, reinterpret_cast<intptr_t>(target));
 	masm.Br(RXVIXLSCRATCH);
 	masm.FinalizeCode();

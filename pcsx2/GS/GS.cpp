@@ -16,9 +16,11 @@
 #include "Host.h"
 #include "Input/InputManager.h"
 #include "MTGS.h"
+#include "PerformanceMetrics.h"
 #include "pcsx2/GS.h"
 #include "GS/Renderers/Common/GSBackThreadPolicy.h"
 #include "GS/Renderers/Common/GSCopyRoadBlendingPolicy.h"
+#include "GS/Renderers/Common/GSHeadlessPresent.h"
 #include "GS/Renderers/Null/GSDeviceNone.h"
 #include "GS/Renderers/Null/GSRendererNull.h"
 #include "GS/Renderers/HW/GSRendererHW.h"
@@ -59,7 +61,10 @@
 #include "fmt/format.h"
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <algorithm>
 #include <array>
 #include <string_view>
@@ -68,6 +73,13 @@ Pcsx2Config::GSOptions GSConfig;
 
 static GSRendererType GSCurrentRenderer;
 static bool GSCurrentPresenterOffsetsRead;
+// The API of the device that is open, kept apart from the device itself (which the GS thread creates and destroys)
+// so another thread can ask.
+static std::atomic<RenderAPI> GSCurrentRenderAPI{RenderAPI::None};
+// What the CPU thread last asked the device for, as given to GSopen() and GSSetVSyncMode(). GS thread only.
+// A device keeps the mode it fell back to, so GSreopen() uses these rather than asking the old device.
+static GSVSyncMode s_requested_vsync_mode = GSVSyncMode::Disabled;
+static bool s_requested_present_throttle = false;
 
 GSRendererType GSGetCurrentRenderer()
 {
@@ -78,6 +90,11 @@ bool GSIsHardwareRenderer()
 {
 	// Null gets flagged as hw.
 	return (GSCurrentRenderer != GSRendererType::SW);
+}
+
+RenderAPI GSGetCurrentRenderAPI()
+{
+	return GSCurrentRenderAPI.load(std::memory_order_relaxed);
 }
 
 bool GSPresenterOffsetsFramebufferRead()
@@ -132,8 +149,9 @@ static RenderAPI GetAPIForRenderer(GSRendererType renderer)
 	}
 }
 
+// create_error receives the backend's reason when Create() fails and it has one (GSDevice::GetCreateError).
 static bool OpenGSDevice(GSRendererType renderer, bool clear_state_on_fail, bool recreate_window,
-	GSVSyncMode vsync_mode, bool allow_present_throttle)
+	GSVSyncMode vsync_mode, bool allow_present_throttle, std::string* create_error = nullptr)
 {
 	const RenderAPI new_api = GetAPIForRenderer(renderer);
 	switch (new_api)
@@ -182,6 +200,8 @@ static bool OpenGSDevice(GSRendererType renderer, bool clear_state_on_fail, bool
 	else
 	{
 		Console.Error("Failed to create GS device");
+		if (create_error)
+			*create_error = g_gs_device->GetCreateError();
 	}
 
 	if (!okay)
@@ -189,11 +209,16 @@ static bool OpenGSDevice(GSRendererType renderer, bool clear_state_on_fail, bool
 		ImGuiManager::Shutdown(clear_state_on_fail);
 		g_gs_device->Destroy();
 		g_gs_device.reset();
+		GSCurrentRenderAPI.store(RenderAPI::None, std::memory_order_relaxed);
 		Host::ReleaseRenderWindow();
 		return false;
 	}
 
-	if (!g_gs_device->SetGPUTimingEnabled(true))
+	GSCurrentRenderAPI.store(new_api, std::memory_order_relaxed);
+
+	const bool gpu_timing = g_gs_device->SetGPUTimingEnabled(true);
+	PerformanceMetrics::SetGPUTimerSupported(gpu_timing);
+	if (!gpu_timing)
 		GSConfig.OsdShowGPU = false;
 	if (GSConfig.OsdShowGPUStats && !g_gs_device->SetGPUPipelineStatisticsEnabled(true))
 		GSConfig.OsdShowGPUStats = false;
@@ -212,6 +237,7 @@ static void CloseGSDevice(bool clear_state)
 	ImGuiManager::Shutdown(clear_state);
 	g_gs_device->Destroy();
 	g_gs_device.reset();
+	GSCurrentRenderAPI.store(RenderAPI::None, std::memory_order_relaxed);
 }
 
 static void GSClampUpscaleMultiplier(Pcsx2Config::GSOptions& config)
@@ -300,8 +326,7 @@ static void GSResolveBackThreadMode(Pcsx2Config::GSOptions& config, GSRendererTy
 	const GSBackThreadDecision decision = GSDecideBackThreadFor(config, renderer);
 	config.BackThreadResolved = decision.on;
 
-	// A request for the split that does not get it is worth a warning. The "GS: back thread"
-	// wording is what measurement scripts grep for.
+	// Scripts grep the log for the "GS: back thread" wording.
 	if (decision.on != config.BackThread)
 		Console.Warning("GS: back thread off, not pipelined (%s).", GSBackThreadReasonText(decision.reason));
 	else
@@ -513,8 +538,9 @@ bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_r
 	{
 		// We need a new render window when changing APIs.
 		const bool recreate_window = (g_gs_device->GetRenderAPI() != GetAPIForRenderer(GSConfig.Renderer));
-		const GSVSyncMode vsync_mode = g_gs_device->GetVSyncMode();
-		const bool allow_present_throttle = g_gs_device->IsPresentThrottleAllowed();
+		// The new device gets the requested mode, not the old device's fallback result.
+		const GSVSyncMode vsync_mode = s_requested_vsync_mode;
+		const bool allow_present_throttle = s_requested_present_throttle;
 		CloseGSDevice(false);
 
 		if (!OpenGSDevice(new_renderer, false, recreate_window, vsync_mode, allow_present_throttle))
@@ -557,8 +583,7 @@ bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_r
 
 u32 GSClearShaderCacheOnGSThread()
 {
-	// Stops the pipeline precompile and replaces the pipeline cache the back thread compiles
-	// against.
+	// Drain first: the back thread compiles against the pipeline cache replaced below.
 	GSDrainBackQueue();
 
 	if (g_gs_device)
@@ -586,11 +611,14 @@ bool GSopen(const Pcsx2Config::GSOptions& config, GSRendererType renderer, u8* b
 	GSVSyncMode vsync_mode, bool allow_present_throttle)
 {
 	GSConfig = config;
+	s_requested_vsync_mode = vsync_mode;
+	s_requested_present_throttle = allow_present_throttle;
 
 	if (renderer == GSRendererType::Auto)
 		renderer = GSUtil::GetPreferredRenderer();
 
-	bool res = OpenGSDevice(renderer, true, false, vsync_mode, allow_present_throttle);
+	std::string create_error;
+	bool res = OpenGSDevice(renderer, true, false, vsync_mode, allow_present_throttle, &create_error);
 	if (res)
 	{
 		res = OpenGSRenderer(renderer, basemem);
@@ -600,10 +628,16 @@ bool GSopen(const Pcsx2Config::GSOptions& config, GSRendererType renderer, u8* b
 
 	if (!res)
 	{
-		Host::ReportErrorAsync("Error",
+		std::string message =
 			fmt::format(TRANSLATE_FS("GS", "Failed to create render device. This may be due to your GPU not supporting the "
 			                               "chosen renderer ({}), or because your graphics drivers need to be updated."),
-			            Pcsx2Config::GSOptions::GetRendererName(GSConfig.Renderer)));
+			            Pcsx2Config::GSOptions::GetRendererName(GSConfig.Renderer));
+		if (!create_error.empty())
+		{
+			message += "\n\n";
+			message += create_error;
+		}
+		Host::ReportErrorAsync("Error", message);
 		return false;
 	}
 
@@ -653,8 +687,58 @@ void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 T
 	GSParseTarget()->ReadLocalMemoryUnsync(mem, qwc, GIFRegBITBLTBUF{BITBLITBUF}, GIFRegTRXPOS{TRXPOS}, GIFRegTRXREG{TRXREG});
 }
 
+#ifdef PCSX2_RECOMPILER_TESTS
+// Test runners (pcsx2-eerunner): with PCSX2_GS_STREAM_OUT=<file> set, writes one line per vsync,
+// "frame hash1 hash2 hash3 bytes": a hash of the quadwords handed to the GS since the last vsync,
+// one per transfer entry point. The entry points are fed whole quadwords, so the hash does not
+// depend on how the MTGS ring splits a transfer. Matching lines from two runs mean the GS got the
+// same bytes in the same order, which checks anything upstream (VU1 and XGKICK, VIF, DMA).
+namespace
+{
+	struct GSStreamHash
+	{
+		std::once_flag once;
+		std::FILE* file = nullptr;
+		u64 h[3] = {0xcbf29ce484222325ull, 0xcbf29ce484222325ull, 0xcbf29ce484222325ull};
+		u64 bytes = 0;
+		u64 frame = 0;
+
+		void Init()
+		{
+			std::call_once(once, [this] {
+				if (const char* path = std::getenv("PCSX2_GS_STREAM_OUT"); path && *path)
+					file = std::fopen(path, "w");
+			});
+		}
+		void Feed(int which, const void* mem, u32 qwc)
+		{
+			const u64* p = static_cast<const u64*>(mem);
+			u64 x = h[which];
+			for (u32 i = 0; i < qwc * 2; i++)
+				x = (x ^ p[i]) * 0x100000001b3ull;
+			h[which] = x;
+			bytes += static_cast<u64>(qwc) * 16;
+		}
+		void Vsync()
+		{
+			std::fprintf(file, "%llu %016llx %016llx %016llx %llu\n", static_cast<unsigned long long>(frame++),
+				static_cast<unsigned long long>(h[0]), static_cast<unsigned long long>(h[1]),
+				static_cast<unsigned long long>(h[2]), static_cast<unsigned long long>(bytes));
+			std::fflush(file);
+			h[0] = h[1] = h[2] = 0xcbf29ce484222325ull;
+			bytes = 0;
+		}
+	};
+	GSStreamHash s_gs_stream_hash;
+} // namespace
+#define GS_STREAM_FEED(which, mem, qwc) 	do 	{ 		s_gs_stream_hash.Init(); 		if (s_gs_stream_hash.file) 			s_gs_stream_hash.Feed(which, mem, qwc); 	} while (0)
+#else
+#define GS_STREAM_FEED(which, mem, qwc) 	do 	{ 	} while (0)
+#endif
+
 void GSgifTransfer(const u8* mem, u32 size)
 {
+	GS_STREAM_FEED(0, mem, size);
 	GSParseTarget()->Transfer<3>(mem, size);
 }
 
@@ -665,11 +749,13 @@ void GSgifTransfer1(u8* mem, u32 addr)
 
 void GSgifTransfer2(u8* mem, u32 size)
 {
+	GS_STREAM_FEED(1, mem, size);
 	GSParseTarget()->Transfer<1>(const_cast<u8*>(mem), size);
 }
 
 void GSgifTransfer3(u8* mem, u32 size)
 {
+	GS_STREAM_FEED(2, mem, size);
 	GSParseTarget()->Transfer<2>(const_cast<u8*>(mem), size);
 }
 
@@ -733,8 +819,23 @@ bool GSGetPresentCapSuspended()
 	return s_present_cap_suspended.load(std::memory_order_relaxed);
 }
 
+static std::atomic<u32> s_video_decode_count{0};
+void GSNoteVideoDecode()
+{
+	s_video_decode_count.fetch_add(1, std::memory_order_relaxed);
+}
+u32 GSGetVideoDecodeCount()
+{
+	return s_video_decode_count.load(std::memory_order_relaxed);
+}
+
 void GSvsync(u32 field, bool registers_written)
 {
+#ifdef PCSX2_RECOMPILER_TESTS
+	s_gs_stream_hash.Init();
+	if (s_gs_stream_hash.file)
+		s_gs_stream_hash.Vsync();
+#endif
 	// Update this here because we need to check if the pending draw affects the current frame, so our regs need to be updated.
 	GSState* const front = GSParseTarget();
 	front->PCRTCDisplays.SetVideoMode(front->GetVideoMode());
@@ -820,7 +921,7 @@ void GSPresentCurrentFrame()
 
 void GSThrottlePresentation()
 {
-	if (g_gs_device->GetVSyncMode() == GSVSyncMode::FIFO)
+	if (g_gs_device->GetVSyncMode() == GSVSyncMode::FIFO && !GSHeadless::IsEnabled())
 	{
 		// Let vsync take care of throttling.
 		return;
@@ -831,7 +932,7 @@ void GSThrottlePresentation()
 
 void GSGameChanged(const std::string& serial, u32 crc)
 {
-	// Stops the pipeline precompile and closes the pipeline-key file the back thread records
+	// Stops the pipeline precompile and lets go of the pipeline key list the back thread records
 	// into, and resets hack state its draws use.
 	DrainBackQueueBeforeDeviceMutation();
 
@@ -848,7 +949,8 @@ void GSGameChanged(const std::string& serial, u32 crc)
 bool GSHasDisplayWindow()
 {
 	pxAssert(g_gs_device);
-	return (g_gs_device->GetWindowInfo().type != WindowInfo::Type::Surfaceless);
+	// A headless host's offscreen present target stands in for the window.
+	return (g_gs_device->GetWindowInfo().type != WindowInfo::Type::Surfaceless) || GSHeadless::IsEnabled();
 }
 
 void GSResizeDisplayWindow(u32 width, u32 height, float scale)
@@ -881,6 +983,9 @@ void GSSetVSyncMode(GSVSyncMode mode, bool allow_present_throttle)
 	}};
 	Console.WriteLnFmt(Color_StrongCyan, "Setting vsync mode: {}{}", modes[static_cast<size_t>(mode)],
 		allow_present_throttle ? " (throttle allowed)" : "");
+
+	s_requested_vsync_mode = mode;
+	s_requested_present_throttle = allow_present_throttle;
 
 	DrainBackQueueBeforeDeviceMutation();
 
@@ -1120,11 +1225,10 @@ void GSgetTitleStats(std::string& info)
 
 void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
 {
-	// GV7-2: everything below mutates state the back thread may be reading
-	// mid-draw: GSConfig itself (read on every draw, and its strings are moved
-	// out just below), settings, ImGui font textures, TC purges. The front only
-	// parses on this (MTGS) thread, so a single drain up front quiesces the back
-	// thread for the whole apply.
+	// Everything below mutates state the back thread may be reading mid-draw: GSConfig (read on
+	// every draw; its strings are moved out just below), settings, ImGui font textures, texture
+	// cache purges. The front only parses on this (MTGS) thread, so one drain up front quiesces
+	// the back thread for the whole apply.
 	if (g_gs_renderer)
 		g_gs_renderer->DrainBackQueue();
 

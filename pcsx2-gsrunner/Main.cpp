@@ -71,6 +71,7 @@
 #include "pcsx2/GSDumpReplayer.h"
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
+#include "pcsx2/IopThread/OwnerAsserts.h"
 #include "pcsx2/INISettingsInterface.h"
 #include "pcsx2/ImGui/FullscreenUI.h"
 #include "pcsx2/ImGui/ImGuiFullscreen.h"
@@ -140,6 +141,7 @@ namespace GSRunner
 	static bool ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& params);
 	static void DumpStats();
 	static bool ReportHashMemoVerify();
+	static bool ReportBlockHashVerify();
 
 	static bool CreatePlatformWindow();
 	static void DestroyPlatformWindow();
@@ -174,11 +176,11 @@ static u64 s_gs_pin_mask = 0;
 static std::string s_gs_pin_effective("none");
 static const char* s_gs_pin_source = "none";
 
-// -gsbackpin. Where the GS back thread (GS multi-threading) runs. Without the flag it is
-// placed by VMManager exactly as the app places it -- next to the MTGS thread -- and
-// re-derived next to the -gspin set when -gspin moves the MTGS thread. "any" restores the
-// old unplaced behaviour (every processor), for A/B runs. s_gs_back_pin_applied is what
-// the stats JSON records: "vmmanager", "near-gspin", "any", or the CPU list given.
+// -gsbackpin. Where the GS back thread (GS multi-threading) runs. Without the flag VMManager
+// places it as the app does, next to the MTGS thread, and re-derives that placement next to
+// the -gspin set when -gspin moves the MTGS thread. "any" leaves it unplaced (every
+// processor), for A/B runs. s_gs_back_pin_applied is what the stats JSON records:
+// "vmmanager", "near-gspin", "any", or the CPU list given.
 static std::string s_gs_back_pin_request;
 static u64 s_gs_back_pin_mask = 0;
 static std::string s_gs_back_pin_applied("vmmanager");
@@ -474,7 +476,9 @@ static u64 s_total_sprite_edge_clamp_draws = 0;
 static double s_last_sw_palette_block_copies = 0;
 static u64 s_total_sw_palette_block_copies = 0;
 static bool s_vm_hash = false;
+static bool s_vm_hash_flush = false;
 static bool s_verify_hash_memo = false;
+static bool s_verify_block_hash = false;
 
 static u64 s_total_prims = 0;
 static u64 s_total_tc_source_hit = 0;
@@ -773,6 +777,10 @@ void Host::BeginPresentFrame()
 	// anything reads it), so a change that must leave local memory alone is checked on this too.
 	if (s_vm_hash && g_gs_renderer)
 	{
+		// Every target written back first, so the hash is of local memory as a reader would find it, whichever
+		// targets hold what (a draw may keep words on the GPU that local memory gets only when they are read).
+		if (s_vm_hash_flush)
+			g_gs_renderer->ReadbackTextureCache();
 		const u64 hash = GSXXH3_64bits(g_gs_renderer->m_mem.m_vm8, GSLocalMemory::m_vmsize);
 		Console.WriteLn(fmt::format("GS local memory hash: loop {} frame {} {:016x}", s_loop_number, s_dump_frame_number, hash));
 	}
@@ -1011,6 +1019,7 @@ void Host::OnSaveStateSaved(const std::string_view filename)
 
 void Host::RunOnCPUThread(std::function<void()> function, bool block /* = false */)
 {
+	BLOCKING_HOST_CALL_ASSERT(block);
 	// Queued here and drained in PumpMessagesOnCPUThread(). Previously a hard
 	// pxFailRel, which meant any PINE command that marshals to the CPU thread
 	// (settings apply, savestates, frame advance) aborted the whole run.
@@ -1191,12 +1200,19 @@ static void PrintCommandLineHelp(const char* progname)
 						 "Turnip before Mesa 26.2 does, so destination-alpha tests take the no-stencil choices.\n");
 	std::fprintf(stderr, "  -alpha-bit-logic-op: Vulkan only. Set and clear alpha bit 7 (FBMSK 0x7FFFFFFF draws) with a "
 						 "logic op on any device with the logicOp feature, not only where a target read waits per draw.\n");
+	std::fprintf(stderr, "  -date-copy-with-ad-blend: Where alpha-bit marks take the logic op, let a destination-alpha "
+						 "draw that blends with destination alpha share the stencil copy, as before that was refused. "
+						 "Such a draw then takes RT alpha correction, a full-target conversion each way.\n");
 	std::fprintf(stderr, "  -vertex-ring-kib <n>: Vulkan only. Start the vertex ring at n KiB instead of the shipped "
 						 "size; it still grows on demand to its cap.\n");
 	std::fprintf(stderr, "  -readback-kick-passes <n>: Vulkan only. In a frame near a readback, submit at a render-pass "
 						 "boundary only once n passes are unsubmitted (default 8).\n");
 	std::fprintf(stderr, "  -vertex-ring-no-grow: Vulkan only. The vertex ring keeps its starting size and waits for "
 						 "the GPU when full.\n");
+	std::fprintf(stderr, "  -texture-ring-no-grow: Vulkan only. The texture upload ring keeps its starting size and "
+						 "waits for the GPU when full.\n");
+	std::fprintf(stderr, "  -stream-rings-cached: Vulkan only. Put the stream rings on a cached memory road as if the "
+						 "driver database preferred it on this device.\n");
 	std::fprintf(stderr, "  -swthreads <threads>: Sets the number of threads for the software renderer.\n");
 	std::fprintf(stderr, "  -upscale <multiplier>: Sets the upscale multiplier, e.g. 1 for native or 2 for 2x. Minimum 0.5.\n");
 	std::fprintf(stderr, "  -renderhacks [af|cpufb|dds|dpi|dsf|tinrt|plf]: Enable user hacks -- auto flush, CPU framebuffer "
@@ -1256,10 +1272,24 @@ static void PrintCommandLineHelp(const char* progname)
 						 "packets, so the two arms compare word for word.\n");
 	std::fprintf(stderr, "  -ladder-out <path>: Where to write the ladder rungs. Only used if -ladder is used.\n");
 	std::fprintf(stderr, "  -vmhash: Log a hash of GS local memory at every presented frame.\n");
+	std::fprintf(stderr, "  -vmhash-flush: -vmhash, with every texture cache target read back into local memory first.\n");
 	std::fprintf(stderr, "  -verify-hash-memo: Check the hardware renderer's memo of texture hashes and the write stamps "
 						 "it relies on. Every memo hit also hashes the texture afresh and compares, and at every frame "
 						 "boundary each page of local memory is hashed to find stores that were not marked. Prints one "
 						 "HASH-MEMO-VERIFY line at exit and exits non-zero on a mismatch or a missed writer.\n");
+	std::fprintf(stderr, "  -verify-block-hash: Check the hardware renderer's per-block hash cache and the marks it relies on. "
+						 "Every paletted window keyed through the cache has each of its blocks hashed afresh and compared "
+						 "with the cached hash, is keyed again without the cache, and the two keys must agree on which "
+						 "windows are one. Prints one BLOCK-HASH-VERIFY line at exit and exits non-zero on a stale block "
+						 "hash or a disagreement. Slow: the memo of texture hashes is not used.\n");
+	std::fprintf(stderr, "  -block-hash-cache on|off: Key paletted windows through the per-block hash cache (on, the default) "
+						 "or by one hash of their raw blocks with no cache (off). Pixels and hash cache hits are the same "
+						 "either way; off is for checking a suspect title without a rebuild.\n");
+	std::fprintf(stderr, "  -hash-cache-entries <n>: Most entries the hardware renderer's hash cache keeps (0 = no limit; "
+						 "the default is the renderer's own). Entries unused for 30 frames go regardless.\n");
+	std::fprintf(stderr, "  -hash-cache-mb <n>: Most megabytes of textures the hash cache keeps above its floor of 800 "
+						 "entries (0 = no limit; the default is the renderer's own). -hash-cache-entries 800 -hash-cache-mb 0 "
+						 "is the cache as it was before the memory limit.\n");
 	std::fprintf(stderr, "  -stats-json <path>: Write per-frame and run-summary statistics as JSON. Combine with -perf "
 						 "for frame/GPU timing.\n");
 	std::fprintf(stderr, "  -set <Section/Key>=<value>: Override any setting, e.g. -set EmuCore/GS/AccurateBlendingUnit=3. "
@@ -1291,6 +1321,9 @@ static void PrintCommandLineHelp(const char* progname)
 						 "-- only when it is stated changes, and that is byte-identical. Measurement instrument only: "
 						 "on Turnip the create flag puts the driver's serialising primitive mode on every pipeline in "
 						 "a latched pass and costs up to 2.8x (wrc3@1x, SD865: 51.8 ms against 18.5). Vulkan only.\n");
+	std::fprintf(stderr, "  -runs <on|off>: The Vulkan run machine (GSRunsVK.h), on by default where the device has its "
+						 "features. off draws every draw on the classic path: the baseline of the machine's A/Bs and "
+						 "picture checks. Development switch, not a setting.\n");
 	std::fprintf(stderr, "  -no-provoking-vertex: Run as a device without VK_EXT_provoking_vertex, the way Qualcomm's "
 						 "stock Adreno driver does. Pipelines use the first-vertex default, so the provoking-first "
 						 "paths (software flat-shading fixup, expanded-line vertex shader) run on a device that has "
@@ -1621,7 +1654,7 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				const std::optional<int> parsed = ParseNumericArg<int>("-backthread", mode_arg);
 				if (!parsed.has_value())
 					return false;
-				// 3 was the pipelined mode's number when the setting had four modes; older scripts pass it.
+				// 3 is a legacy value (the old pipelined mode); older scripts still pass it.
 				const int mode = parsed.value();
 				if (mode != 0 && mode != 1 && mode != 3)
 				{
@@ -1769,10 +1802,60 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				s_vm_hash = true;
 				continue;
 			}
+			else if (CHECK_ARG("-vmhash-flush"))
+			{
+				s_vm_hash = true;
+				s_vm_hash_flush = true;
+				continue;
+			}
 			else if (CHECK_ARG("-verify-hash-memo"))
 			{
 				s_verify_hash_memo = true;
 				GSTextureCache::SetHashMemoVerify(true);
+				continue;
+			}
+			else if (CHECK_ARG("-verify-block-hash"))
+			{
+				s_verify_block_hash = true;
+				GSTextureCache::SetBlockHashVerify(true);
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-block-hash-cache"))
+			{
+				const char* const value = argv[++i];
+				if (!std::strcmp(value, "off"))
+				{
+					GSTextureCache::SetBlockHashCacheEnabled(false);
+				}
+				else if (!std::strcmp(value, "on"))
+				{
+					GSTextureCache::SetBlockHashCacheEnabled(true);
+				}
+				else
+				{
+					ArgError("-block-hash-cache: expected on or off, got '{}'.", value);
+					return false;
+				}
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-hash-cache-entries"))
+			{
+				const std::optional<u32> value = ParseNumericArg<u32>("-hash-cache-entries", argv[++i]);
+				if (!value.has_value())
+					return false;
+				GSTextureCache::HashCacheLimits limits = GSTextureCache::GetHashCacheLimits();
+				limits.max_entries = value.value();
+				GSTextureCache::SetHashCacheLimits(limits);
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-hash-cache-mb"))
+			{
+				const std::optional<u32> value = ParseNumericArg<u32>("-hash-cache-mb", argv[++i]);
+				if (!value.has_value())
+					return false;
+				GSTextureCache::HashCacheLimits limits = GSTextureCache::GetHashCacheLimits();
+				limits.max_bytes = static_cast<u64>(value.value()) << 20;
+				GSTextureCache::SetHashCacheLimits(limits);
 				continue;
 			}
 			else if (CHECK_ARG_PARAM("-drawlog"))
@@ -1937,6 +2020,14 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				Console.WriteLn("Forcing the alpha-bit logic op on (Vulkan, where logicOp exists)");
 				continue;
 			}
+			else if (CHECK_ARG("-date-copy-with-ad-blend"))
+			{
+				// Not a setting: the refusal it lifts is a cost fact about one road. This restores
+				// the earlier rule so the two can be priced on one binary.
+				g_gs_measurement_overrides.date_copy_with_dst_alpha_blend = true;
+				Console.WriteLn("Letting destination-alpha draws that blend with destination alpha share the stencil copy");
+				continue;
+			}
 			else if (CHECK_ARG("-no-provoking-vertex"))
 			{
 				// Not a setting: whether a device has a usable provoking-last mode is a driver fact
@@ -1953,6 +2044,17 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				// fallback on a device that has the feature, for an A/B on one binary.
 				g_gs_measurement_overrides.no_dual_source = true;
 				Console.WriteLn("Forcing dual-source blending off (Vulkan, as a device without dualSrcBlend)");
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-runs"))
+			{
+				const char* arg = argv[++i];
+				if (std::strcmp(arg, "on") != 0 && std::strcmp(arg, "off") != 0)
+				{
+					ArgError("-runs: expected on or off.");
+					return false;
+				}
+				g_gs_measurement_overrides.runs_off = std::strcmp(arg, "off") == 0;
 				continue;
 			}
 			else if (CHECK_ARG_PARAM("-vertex-ring-kib"))
@@ -1978,6 +2080,19 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				}
 				// Not a setting: what a submit costs is a property of the driver, priced per device.
 				g_gs_measurement_overrides.readback_kick_passes = passes.value();
+				continue;
+			}
+			else if (CHECK_ARG("-texture-ring-no-grow"))
+			{
+				// Not a setting: a texture ring that keeps its starting size, for an A/B on one binary.
+				g_gs_measurement_overrides.texture_ring_no_growth = true;
+				continue;
+			}
+			else if (CHECK_ARG("-stream-rings-cached"))
+			{
+				// Not a setting: whether cached stream-ring memory pays is measured per device and recorded in
+				// the driver database (DriverWorkaround::PreferCachedStreamRingMemory).
+				g_gs_measurement_overrides.stream_rings_cached = true;
 				continue;
 			}
 			else if (CHECK_ARG("-vertex-ring-no-grow"))
@@ -2472,6 +2587,7 @@ static void WriteStatsJson(const std::string& path)
 		s_total_tc_target_hit, s_total_tc_target_miss);
 	std::fprintf(fp.get(), "    \"hash_cache_hit\": %" PRIu64 ",\n    \"hash_cache_miss\": %" PRIu64 ",\n",
 		s_total_hash_cache_hit, s_total_hash_cache_miss);
+	std::fprintf(fp.get(), "    \"mark_all_events\": %" PRIu64 ",\n", GSLocalMemory::TotalMarkAllEvents());
 	std::fprintf(fp.get(), "    \"pipeline_switches\": %s,\n", j_u64(s_total_pipeline_switches).c_str());
 	std::fprintf(fp.get(), "    \"native_texel_grid_draws\": %" PRIu64 ",\n", s_total_native_texel_grid_draws);
 	std::fprintf(fp.get(), "    \"sprite_edge_clamp_draws\": %" PRIu64 ",\n", s_total_sprite_edge_clamp_draws);
@@ -2586,6 +2702,21 @@ bool GSRunner::ReportHashMemoVerify()
 	return report.mismatches == 0 && report.missed_writers == 0;
 }
 
+// Prints what -verify-block-hash found. False if a cached block hash was stale, which is a store into local
+// memory that nothing marked, or if keying with the cache and without it disagreed on which windows are one.
+bool GSRunner::ReportBlockHashVerify()
+{
+	if (!s_verify_block_hash)
+		return true;
+
+	const GSTextureCache::BlockHashVerifyReport report = GSTextureCache::GetBlockHashVerifyReport();
+	const std::string line = fmt::format("BLOCK-HASH-VERIFY levels={} blocks={} stale_blocks={} lookups={} extra_misses={} false_hits={}",
+		report.levels, report.blocks, report.stale_blocks, report.lookups, report.extra_misses, report.false_hits);
+	Console.WriteLn(line);
+	std::fprintf(stderr, "%s\n", line.c_str());
+	return report.stale_blocks == 0 && report.extra_misses == 0 && report.false_hits == 0;
+}
+
 void GSRunner::DumpStats()
 {
 	std::atomic_thread_fence(std::memory_order_acquire);
@@ -2643,6 +2774,31 @@ void GSRunner::DumpStats()
 		Ratio(s_total_tc_target_hit, s_total_tc_target_hit + s_total_tc_target_miss)));
 	Console.WriteLn(fmt::format("@HWSTAT@ Hash Cache Hit/Miss: {}/{} ({:.1f}% hit)", s_total_hash_cache_hit, s_total_hash_cache_miss,
 		Ratio(s_total_hash_cache_hit, s_total_hash_cache_hit + s_total_hash_cache_miss)));
+	// What the hash cache held at the end of a frame (before the frame's ageing): the peak of the run, and the
+	// mean over the frames; MB are 2^20 bytes. "VRAM" is what the renderer accounts for in all: targets,
+	// sources, hash cache and the device's texture pool.
+	{
+		const GSTextureCache::HashCacheStats hc = GSTextureCache::GetHashCacheStats();
+		const GSTextureCache::HashCacheLimits lim = GSTextureCache::GetHashCacheLimits();
+		Console.WriteLn(fmt::format("@HWSTAT@ Hash Cache Memory: peak {:.1f} MB in {} entries (mean {:.1f} MB over {} frames); "
+									"peak VRAM {:.1f} MB; limits {} entries (floor {}), {} MB",
+			hc.peak_bytes / 1048576.0, hc.peak_entries, hc.frames ? hc.sum_bytes / 1048576.0 / hc.frames : 0.0, hc.frames,
+			hc.peak_total_bytes / 1048576.0, lim.max_entries, lim.floor_entries, lim.max_bytes >> 20));
+	}
+	// The per-block hash cache: the paletted levels keyed through it, their blocks, and the blocks that had to be
+	// hashed (a mark since the last lookup). A block is 256 bytes.
+	{
+		const GSTextureCache::BlockHashStats block_hashes = GSTextureCache::GetBlockHashStats();
+		const double frames = static_cast<double>(std::max<u64>(s_total_drawn_frames, 1));
+		Console.WriteLn(fmt::format("@HWSTAT@ Block Hash Cache: {} levels, {} blocks keyed, {} hashed ({:.1f}% of blocks; {:.2f} MB/frame hashed)",
+			block_hashes.levels, block_hashes.blocks, block_hashes.rehashed,
+			Ratio(block_hashes.rehashed, block_hashes.blocks),
+			block_hashes.rehashed * static_cast<double>(GS_BLOCK_SIZE) / frames / (1024.0 * 1024.0)));
+	}
+	// Marks of all of local memory (GSLocalMemory::MarkAllEvents): each one dirties every block, so a title that
+	// does it every frame rehashes and restages everything. Counted over the whole process.
+	Console.WriteLn(fmt::format("@HWSTAT@ Mark-All Events: {} (avg {:.2f}/frame)", GSLocalMemory::TotalMarkAllEvents(),
+		GSLocalMemory::TotalMarkAllEvents() / static_cast<double>(std::max<u64>(s_total_drawn_frames, 1))));
 	Console.WriteLn(fmt::format("@HWSTAT@ Native Texel Grid Draws: {} (avg {})", s_total_native_texel_grid_draws,
 		static_cast<u64>(std::ceil(s_total_native_texel_grid_draws / static_cast<double>(s_total_drawn_frames)))));
 	Console.WriteLn(fmt::format("@HWSTAT@ Sprite Edge Clamp Draws: {} (avg {})", s_total_sprite_edge_clamp_draws,
@@ -2887,6 +3043,9 @@ static void CPUThreadMain(VMBootParameters* params, std::atomic<int>* ret)
 			// the GS thread itself, to whichever processor its frequency sort ranked next.
 			// Moving this call any earlier means that pin quietly overwrites -gspin, and
 			// the only visible symptom would be that the flag stops doing anything.
+			// A hand placement (-gspin, -gsbackpin) must not be moved by VMManager's automatic prime-core placement.
+			if (!s_gs_pin_request.empty() || !s_gs_back_pin_request.empty())
+				VMManager::Internal::DisablePrimeCorePlacement();
 			ApplyGSThreadPin();
 			ApplyGSBackThreadPin();
 
@@ -2925,8 +3084,9 @@ static void CPUThreadMain(VMBootParameters* params, std::atomic<int>* ret)
 				s_extended_stats_snapshot = g_gs_device->GetExtendedStats();
 			VMManager::Shutdown(false);
 			GSRunner::DumpStats();
-			const bool verify_ok = GSRunner::ReportHashMemoVerify();
-			ret->store((ladder_ok && verify_ok) ? EXIT_SUCCESS : EXIT_FAILURE);
+			const bool memo_verify_ok = GSRunner::ReportHashMemoVerify();
+			const bool block_hash_verify_ok = GSRunner::ReportBlockHashVerify();
+			ret->store((ladder_ok && memo_verify_ok && block_hash_verify_ok) ? EXIT_SUCCESS : EXIT_FAILURE);
 		}
 	}
 

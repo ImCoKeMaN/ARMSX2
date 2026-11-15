@@ -85,6 +85,40 @@ s32 SPU2Savestate::FreezeIt(DataBlock& spud)
 	return 0;
 }
 
+#ifdef PCSX2_RECOMPILER_TESTS
+// Test-only, for ee_divtrace::FingerprintIop. Fills 'out' with the block
+// SPU2freeze(Save) writes, with the one process-dependent part made stable:
+// V_Voice::SBuffer is a raw pointer into pcm_cache_data that FreezeIt copies
+// as it is (ThawIt rebuilds it from NextA), so it moves with ASLR. It becomes
+// the byte offset into pcm_cache_data, or ~0 for null. DMAPtr/DMARPtr are
+// already offsets after FreezeIt. Nothing is mixed or run: TimeUpdate and the
+// ADPCM cache are not touched.
+void SPU2freezeForFingerprint(std::vector<u8>& out)
+{
+	out.assign(sizeof(SPU2Savestate::DataBlock), 0);
+	auto& spud = *reinterpret_cast<SPU2Savestate::DataBlock*>(out.data());
+	SPU2Savestate::FreezeIt(spud);
+
+	const u8* const cache_lo = reinterpret_cast<const u8*>(pcm_cache_data);
+	const u8* const cache_hi = cache_lo + sizeof(pcm_cache_data);
+	for (V_Core& core : spud.Cores)
+	{
+		for (V_Voice& vc : core.Voices)
+		{
+			const u8* const p = reinterpret_cast<const u8*>(vc.SBuffer);
+			uptr v;
+			if (!p)
+				v = ~static_cast<uptr>(0);
+			else if (p >= cache_lo && p < cache_hi)
+				v = static_cast<uptr>(p - cache_lo);
+			else
+				v = ~static_cast<uptr>(1); // not in the cache: keep it distinct from null
+			vc.SBuffer = reinterpret_cast<s16*>(v);
+		}
+	}
+}
+#endif
+
 s32 SPU2Savestate::ThawIt(DataBlock& spud)
 {
 	if (spud.spu2id != SAVE_ID || spud.version < SAVE_VERSION)

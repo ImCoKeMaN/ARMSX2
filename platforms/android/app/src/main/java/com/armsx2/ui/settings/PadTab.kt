@@ -301,9 +301,21 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
             // usually whatever presses something first. Pins are stored per controller (by
             // descriptor, so they survive reconnects) and set once, rather than raced for at the
             // start of every session.
+            //
+            // Or every controller on player 1, for one person who docks the handheld: its own
+            // controls and the pad it is docked with then both play, with nothing to assign.
+            val allToPlayer1 = remember(refreshToken.intValue) { com.armsx2.input.PadRouter.allToPlayer1 }
+            ToggleRow(
+                str("pad.allToPlayer1.label"),
+                allToPlayer1,
+                description = str("pad.allToPlayer1.description"),
+            ) {
+                com.armsx2.input.PadRouter.setAllToPlayer1(it)
+                refreshToken.intValue++
+            }
             val pads = remember(refreshToken.intValue) { com.armsx2.input.PadRouter.connectedPads() }
             if (pads.isNotEmpty()) {
-                HelpText(str("pad.assign.help"))
+                if (!allToPlayer1) HelpText(str("pad.assign.help"))
                 HelpText(str("pad.assign.rumbleHelp"))
                 // Only the slots Multitap actually arms. Offering player 3-8 with Multitap off
                 // would let the user pin a pad at an un-armed PS2 port, where its input goes
@@ -321,7 +333,7 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
                 )
                 pads.forEach { pad ->
                     val pinnedPort = com.armsx2.input.PadRouter.pins()[pad.descriptor]
-                    SegmentedRow(
+                    if (!allToPlayer1) SegmentedRow(
                         label = pad.name,
                         options = slotLabels,
                         selectedIndex = (pinnedPort?.plus(1) ?: 0).coerceIn(0, slotLabels.lastIndex),
@@ -787,25 +799,32 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
             // Controller hotkeys now live in their own dedicated "Hotkeys" tab
             // (see HotkeysTab) so they're easier to find than buried under Pad.
             SettingsDivider()
-            val visibilityOff = str("setup.toggle.off")
-            val visibilityAuto = str("backend.renderer.auto")
-            val visibilityAlways = str("pad.onScreenControls.always")
-            IntSliderRow(
+            // Four named choices instead of one 0..12 slider where Off was the far-left stop and
+            // the seconds and the two modes shared a track. The stored values are unchanged.
+            val visibilityMode = TouchControls.visibilityMode.intValue
+            SegmentedRow(
                 label = str("pad.onScreenControls.label"),
-                value = TouchControls.visibilityMode.value,
-                min = 0,
-                max = TouchControls.VISIBILITY_ALWAYS,
+                // In the order of TouchControls.visibilityChoices.
+                options = listOf(
+                    str("backend.renderer.auto"),
+                    str("pad.onScreenControls.always"),
+                    str("setup.toggle.off"),
+                    str("pad.onScreenControls.autoHide"),
+                ),
+                selectedIndex = TouchControls.visibilityChoices.indexOf(TouchControls.visibilityChoice()),
                 description = str("pad.onScreenControls.description"),
-                valueFormatter = {
-                    when (it) {
-                        0 -> visibilityOff
-                        11 -> visibilityAuto
-                        TouchControls.VISIBILITY_ALWAYS -> visibilityAlways
-                        else -> "${it}s"
-                    }
-                },
-                onChange = { TouchControls.setVisibilityMode(it) },
+                onChange = { TouchControls.chooseVisibility(TouchControls.visibilityChoices[it]) },
             )
+            if (visibilityMode in 1..10) {
+                IntSliderRow(
+                    label = str("pad.onScreenControls.autoHideAfter"),
+                    value = visibilityMode,
+                    min = 1,
+                    max = 10,
+                    valueFormatter = { "${it}s" },
+                    onChange = { TouchControls.setVisibilityMode(it) },
+                )
+            }
             SettingsDivider()
             // Touch as Player 2: one person on a controller, another on the screen. Asked for by
             // players who share a device; Player 1 is the controller's, so nothing else changes.
@@ -835,6 +854,26 @@ fun PadTab(@Suppress("UNUSED_PARAMETER") state: MutableState<Settings>) {
                 valueFormatter = { "${it}%" },
                 onChange = { TouchControls.setMultiTouchRadius(it / 100f) },
             )
+            SettingsDivider()
+            // One travel for every touch stick: how far the thumb moves for full tilt. Longer
+            // leaves more of the drag for walking and slow aiming.
+            IntSliderRow(
+                label = str("pad.stickTravel.label"),
+                value = TouchControls.stickTravelPercent.intValue,
+                min = TouchControls.STICK_TRAVEL_MIN,
+                max = TouchControls.STICK_TRAVEL_MAX,
+                description = str("pad.stickTravel.description"),
+                valueFormatter = { "${it}%" },
+                onChange = { TouchControls.setStickTravelPercent(it) },
+            )
+            SettingsDivider()
+            // L1/L2/R1/R2 touch areas cut to their artwork: without it the shoulder squares and
+            // their multi-touch circles reach far past the wide sprites.
+            ToggleRow(
+                str("pad.tightShoulders.label"),
+                TouchControls.tightShoulders.value,
+                description = str("pad.tightShoulders.description"),
+            ) { TouchControls.setTightShoulders(it) }
             SettingsDivider()
             // How hard the DS2 pressure modifier presses. There was a PRESSURE button (on-screen
             // and bindable as "Pressure Modifier (hold)") but no way to choose the amount, so it

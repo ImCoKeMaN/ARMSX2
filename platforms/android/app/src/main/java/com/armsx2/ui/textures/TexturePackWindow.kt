@@ -63,26 +63,21 @@ import coil.request.ImageRequest
 import com.armsx2.R
 import com.armsx2.TextureCatalog
 import com.armsx2.TexturePackInstallState.InstallAction
-import com.armsx2.TexturePackLinks
 import com.armsx2.i18n.str
 import com.armsx2.ui.common.PadModal
 import com.armsx2.ui.settings.controllerFocusable
 
 /**
- * A texture pack's window, opened by its Get button. A banner in its creator's colours says what the
- * pack is; a row of tiles in the shape of the save state ones, larger, holds the creator (their
- * profile picture), the pack's source, and the creator's tip and socials pages; then the pack's
- * description, with Download last.
+ * A texture pack's window, opened by its Get button: a banner in the creator's colours, a row of
+ * tiles (creator, pack source, tip and socials pages), the description, and Download last.
  *
- * The creator's colour is picked from their picture once it loads, and from their name until then
- * (and for good when they have none), so every creator's window looks like theirs. Depth comes from
- * gradients and borders only: no shadows and no blur, which some Adreno and Mali drivers draw as
- * solid boxes (see controllerFocusable).
+ * The creator's colour comes from their picture once it loads, and from their name until then (and
+ * when they have no picture). Depth comes from gradients and borders only: no shadows and no blur,
+ * which some Adreno and Mali drivers draw as solid boxes (see controllerFocusable).
  */
 @Composable
 internal fun PackWindow(
     pack: TextureCatalog.Pack,
-    links: TexturePackLinks.Links?,
     creator: String,
     sizeText: String,
     action: InstallAction,
@@ -93,9 +88,9 @@ internal fun PackWindow(
 ) {
     val layer = "tex-pack"
     val bodyScroll = rememberScrollState()
-    // One install at a time, as before; and an installed pack that is up to date has nothing to get.
+    // Only one install at a time, and nothing to get for a pack that is installed and up to date.
     val canDownload = !anyBusy && action != InstallAction.INSTALLED
-    var picked by remember(links?.avatar) { mutableStateOf<Color?>(null) }
+    var picked by remember(pack.lead?.avatar) { mutableStateOf<Color?>(null) }
     val accent by animateColorAsState(
         picked ?: nameColor(creator.ifEmpty { pack.name }),
         label = "packAccent",
@@ -119,12 +114,11 @@ internal fun PackWindow(
                 // Banner, tiles and description scroll together, so a short landscape screen keeps
                 // Download in view and the pad's Up/Down reach the rest.
                 Column(Modifier.weight(1f, fill = false).verticalScroll(bodyScroll)) {
-                    Banner(pack, links, creator, accent, sizeText)
+                    Banner(pack, creator, accent, sizeText)
                     Column(Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp)) {
                         Tiles(
                             layer = layer,
                             pack = pack,
-                            links = links,
                             creator = creator,
                             accent = accent,
                             openUrl = openUrl,
@@ -170,11 +164,9 @@ internal fun PackWindow(
     }
 }
 
-/** The pack's name and facts on the creator's colours, with their picture fading in at the right. */
 @Composable
 private fun Banner(
     pack: TextureCatalog.Pack,
-    links: TexturePackLinks.Links?,
     creator: String,
     accent: Color,
     sizeText: String,
@@ -184,7 +176,6 @@ private fun Banner(
         Modifier
             .fillMaxWidth()
             .background(deep)
-            // A glow of the creator's colour from the top left.
             .background(
                 Brush.radialGradient(
                     listOf(accent.copy(alpha = 0.75f), Color.Transparent),
@@ -194,7 +185,7 @@ private fun Banner(
             ),
     ) {
         Box(Modifier.matchParentSize()) {
-            val avatar = links?.avatar
+            val avatar = pack.lead?.avatar
             if (avatar != null) {
                 // Square, at the banner's own height: the whole picture, never stretched across it.
                 Box(
@@ -210,7 +201,6 @@ private fun Banner(
                         alpha = 0.75f,
                         modifier = Modifier.fillMaxSize(),
                     )
-                    // Faded into the banner on its left, so it reads as part of it.
                     Box(
                         Modifier
                             .fillMaxSize()
@@ -264,15 +254,14 @@ private fun Banner(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                links?.type?.let { Fact(str("textures.pack.type"), typeLabel(it)) }
-                links?.status?.let { Fact(str("textures.pack.status"), statusLabel(it), statusColor(it)) }
+                pack.type?.let { Fact(str("textures.pack.type"), typeLabel(it)) }
+                pack.completeness?.let { Fact(str("textures.pack.status"), statusLabel(it), statusColor(it)) }
                 Fact(str("textures.pack.size"), sizeText)
             }
         }
     }
 }
 
-/** One fact on the banner: a small caption over its value, on frosted glass. */
 @Composable
 private fun Fact(label: String, value: String, dot: Color? = null) {
     Column(
@@ -300,15 +289,14 @@ private fun Fact(label: String, value: String, dot: Color? = null) {
 private fun Tiles(
     layer: String,
     pack: TextureCatalog.Pack,
-    links: TexturePackLinks.Links?,
     creator: String,
     accent: Color,
     openUrl: (String) -> Unit,
     onPicked: (Color) -> Unit,
 ) {
-    val source = links?.source ?: pack.sourceUrl.ifEmpty { null }
-    val tip = links?.tip
-    val socials = links?.socials
+    val source = pack.sourceUrl.ifEmpty { null }
+    val tip = pack.lead?.tip
+    val socials = pack.lead?.socials
     val count = 1 + listOfNotNull(source, tip, socials).size
     // Larger than a save state tile where there is room; smaller on a short landscape screen, so the
     // banner, the tiles and Download still fit without scrolling.
@@ -326,10 +314,10 @@ private fun Tiles(
                 id = "$layer.creator",
                 size = size,
                 name = creator,
-                avatar = links?.avatar,
+                avatar = pack.lead?.avatar,
                 accent = accent,
                 onPicked = onPicked,
-                onClick = links?.creatorPage?.let { page -> { openUrl(page) } },
+                onClick = pack.lead?.page?.let { page -> { openUrl(page) } },
             )
             source?.let {
                 LinkTile("$layer.source", size, R.drawable.ic_link_out, str("textures.online.source"), it,
@@ -403,7 +391,6 @@ private fun LinkTile(
 ) {
     TileFrame(id = id, size = size, borderColor = Color.White.copy(alpha = 0.14f), onClick = { openUrl(url) }) {
         Box(Modifier.fillMaxSize().background(Brush.linearGradient(colors)))
-        // A soft disc of light in the corner, for depth without a shadow.
         Box(
             Modifier
                 .size(size)
@@ -445,7 +432,6 @@ internal fun TileFrame(
     )
 }
 
-/** A tile's name over a dark fade, as on the save state tiles. */
 @Composable
 internal fun BoxScope.TileLabel(title: String, subtitle: String) {
     Box(
@@ -519,30 +505,30 @@ private fun PillButton(
     }
 }
 
-/** The archive's texture types, in the app's language; one it adds later shows as it words it. */
+/** The catalog's texture types, in the app's language; one it adds later shows as the catalog gives it. */
 @Composable
-private fun typeLabel(raw: String): String = when (raw.lowercase()) {
-    "ai upscale" -> str("textures.pack.type.aiUpscale")
+private fun typeLabel(raw: String): String = when (raw) {
+    "ai_upscale" -> str("textures.pack.type.aiUpscale")
     "handcrafted" -> str("textures.pack.type.handcrafted")
     "mixed" -> str("textures.pack.type.mixed")
     "port" -> str("textures.pack.type.port")
-    "button replacement" -> str("textures.pack.type.buttons")
+    "button_replacement" -> str("textures.pack.type.buttons")
     else -> raw
 }
 
-/** The archive's pack statuses, in the app's language; one it adds later shows as it words it. */
+/** The catalog's completeness values, in the app's language; one it adds later shows as the catalog gives it. */
 @Composable
-private fun statusLabel(raw: String): String = when (raw.lowercase()) {
+private fun statusLabel(raw: String): String = when (raw) {
     "complete" -> str("textures.pack.status.complete")
-    "in-progress" -> str("textures.pack.status.inProgress")
+    "in_progress" -> str("textures.pack.status.inProgress")
     "incomplete" -> str("textures.pack.status.incomplete")
     "partial" -> str("textures.pack.status.partial")
     else -> raw
 }
 
-private fun statusColor(raw: String): Color = when (raw.lowercase()) {
+private fun statusColor(raw: String): Color = when (raw) {
     "complete" -> Color(0xFF5BE49B)
-    "in-progress" -> Color(0xFFFFC857)
+    "in_progress" -> Color(0xFFFFC857)
     "incomplete" -> Color(0xFFFF8A5B)
     "partial" -> Color(0xFF7FB3FF)
     else -> Color.White.copy(alpha = 0.6f)
@@ -551,7 +537,7 @@ private fun statusColor(raw: String): Color = when (raw.lowercase()) {
 private fun host(url: String): String =
     runCatching { java.net.URI(url).host.orEmpty().removePrefix("www.") }.getOrDefault("")
 
-/** Each place a pack can come from in its own colours: plain gradients, no one's logo. */
+/** Tile gradient for a pack source, by host, with a default for unknown hosts. */
 private fun sourceColors(url: String): List<Color> {
     val h = host(url)
     return when {

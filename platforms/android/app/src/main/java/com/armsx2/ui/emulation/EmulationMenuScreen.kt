@@ -85,6 +85,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
+/** The Friends panel's nav layer: only its controls answer the pad while it is open. */
+private const val FRIENDS_NAV_LAYER = "menu.friends"
+
 @Composable
 fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
     val state = viewModel.state.value
@@ -92,6 +95,11 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
     var shown by remember { mutableStateOf(false) }
     var dismissing by remember { mutableStateOf(false) }
     var friendsOpen by remember { mutableStateOf(false) }
+    // A friend waiting to be let in is answered in the hosting panel, which sits with Friends: the
+    // menu opens there, whether it was opened for the question or was already open.
+    val hostStatus by com.armsx2.remoteplay.RemotePlayHost.status
+    val asking = hostStatus is com.armsx2.remoteplay.RemotePlayHost.Status.Asking
+    LaunchedEffect(asking) { if (asking) friendsOpen = true }
     val closeMenu: () -> Unit = remember(viewModel, scope) {
         {
             if (!dismissing) {
@@ -132,14 +140,16 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
     // The nav registry is shared between the menu and the panel, so ownership has to be explicit:
     // the selection is cleared on both edges, because a selection left pointing at a control on
     // the other side of the transition highlights something the user cannot see.
+    // The panel claims its own nav layer while open: the menu stays composed behind it, and without
+    // a layer a move could pick one of the menu's controls. Closing hands the selection back to
+    // the menu control that opened it.
     DisposableEffect(friendsOpen) {
-        if (friendsOpen) {
-            EmulationMenuInputController.overlayDismiss = { friendsOpen = false }
-            com.armsx2.ui.settings.SettingsControllerNav.clearSelection()
-        }
+        if (!friendsOpen) return@DisposableEffect onDispose {}
+        EmulationMenuInputController.overlayDismiss = { friendsOpen = false }
+        com.armsx2.ui.settings.SettingsControllerNav.pushLayer(FRIENDS_NAV_LAYER)
         onDispose {
             EmulationMenuInputController.overlayDismiss = null
-            com.armsx2.ui.settings.SettingsControllerNav.clearSelection()
+            com.armsx2.ui.settings.SettingsControllerNav.popLayer(FRIENDS_NAV_LAYER)
         }
     }
     // Highlight the panel's first control once it has actually composed. Selecting in the same
@@ -306,28 +316,42 @@ fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
                 shadowElevation = 24.dp,
             ) {
                 Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(start = 16.dp, end = 10.dp, top = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    androidx.compose.runtime.CompositionLocalProvider(
+                        com.armsx2.ui.settings.LocalNavLayer provides FRIENDS_NAV_LAYER,
                     ) {
-                        Text(
-                            str("friends.title"),
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
+                        Row(
+                            Modifier.fillMaxWidth().padding(start = 16.dp, end = 10.dp, top = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                str("friends.title"),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            // Between the title and Close: whose Discord this is.
+                            if (com.armsx2.DiscordPresence.available()) {
+                                com.armsx2.ui.friends.SelfChip(
+                                    Modifier.weight(1f).padding(horizontal = 12.dp),
+                                )
+                            } else {
+                                Spacer(Modifier.weight(1f))
+                            }
+                            TextButton(
+                                onClick = { friendsOpen = false },
+                                modifier = Modifier.controllerFocusable(
+                                    "menu.friends.close",
+                                    onConfirm = { friendsOpen = false },
+                                ),
+                            ) { Text(str("action.close")) }
+                        }
+                        // Hosting sits with Friends: there is no room for another tab in this menu.
+                        com.armsx2.remoteplay.RemotePlayHostPanel(
+                            Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
                         )
-                        // Between the title and Close: whose Discord this is.
-                        com.armsx2.ui.friends.SelfChip(
-                            Modifier.weight(1f).padding(horizontal = 12.dp),
-                        )
-                        TextButton(
-                            onClick = { friendsOpen = false },
-                            modifier = Modifier.controllerFocusable(
-                                "menu.friends.close",
-                                onConfirm = { friendsOpen = false },
-                            ),
-                        ) { Text(str("action.close")) }
+                        if (com.armsx2.DiscordPresence.available()) {
+                            com.armsx2.ui.friends.FriendsPanel(Modifier.padding(horizontal = 12.dp))
+                        }
                     }
-                    com.armsx2.ui.friends.FriendsPanel(Modifier.padding(horizontal = 12.dp))
                 }
             }
         }
@@ -621,27 +645,26 @@ private fun MenuHeader(
             Modifier.align(Alignment.CenterVertically),
         )
 
-        // Friends, in the header where it is always visible, with the online count on it. A build
-        // without the SDK has nothing to show, so it does not take up header space there.
-        if (com.armsx2.DiscordPresence.available()) {
-            Spacer(Modifier.width(8.dp))
-            Surface(
-                onClick = onOpenFriends,
-                modifier = Modifier.controllerFocusable(
-                    "menu.friends",
-                    RoundedCornerShape(14.dp),
-                    onConfirm = onOpenFriends,
-                ),
-                shape = RoundedCornerShape(14.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
-            ) {
-                Box(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
-                    com.armsx2.ui.friends.FriendsGlyphWithBadge(
-                        color = MaterialTheme.colorScheme.onSurface,
-                        glyphSize = 19.sp,
-                    )
-                }
+        // Friends, in the header where it is always visible, with the online count on it. Shown
+        // even where Discord is not available: remote play hosting lives behind it too, and
+        // hosting does not need Discord. The Discord parts inside hide themselves there.
+        Spacer(Modifier.width(8.dp))
+        Surface(
+            onClick = onOpenFriends,
+            modifier = Modifier.controllerFocusable(
+                "menu.friends",
+                RoundedCornerShape(14.dp),
+                onConfirm = onOpenFriends,
+            ),
+            shape = RoundedCornerShape(14.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
+        ) {
+            Box(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
+                com.armsx2.ui.friends.FriendsGlyphWithBadge(
+                    color = MaterialTheme.colorScheme.onSurface,
+                    glyphSize = 19.sp,
+                )
             }
         }
     }
@@ -666,10 +689,19 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
             // a GS dump is what gets asked for when someone reports a graphics bug, and this is
             // one tap from the game. It also resumes, because the dump is of the NEXT frame the GS
             // draws, and none is drawn while this menu holds the game paused.
+            //
+            // It is now a choice: keep the dump in the snaps folder as before, or start a problem
+            // report with a fresh dump of this scene.
             MenuAction(str("renderer.gsDump.label"), str("gsdump.quick.detail"), "⧉", null) {
-                runCatching { kr.co.iefriends.pcsx2.NativeApp.captureGsDump(1) }
-                android.widget.Toast.makeText(context, gsDumpQueued, android.widget.Toast.LENGTH_LONG).show()
-                viewModel.resume()
+                com.armsx2.ui.bugreport.askGsDumpChoice {
+                    runCatching { kr.co.iefriends.pcsx2.NativeApp.captureGsDump(1) }
+                    android.widget.Toast.makeText(context, gsDumpQueued, android.widget.Toast.LENGTH_LONG).show()
+                    viewModel.resume()
+                }
+            },
+            // Best place to report graphics and slowness: the scene is still here to capture.
+            MenuAction(str("bugreport.menu.title"), str("bugreport.menu.detail"), "⚑", null) {
+                com.armsx2.ui.bugreport.BugReportFlow.openInGame(context)
             },
         ) + arcadeActions(viewModel) + listOf(
             MenuAction(str("action.close"), MainActivityRuntime.currentGame.value?.title.orEmpty(), "■", Danger) {
@@ -774,11 +806,11 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
         // hold anything or how old they are, so picking a slot to overwrite after a long
         // session was guesswork -- the Save Manager has had the dates all along, but the quick
         // picker is where the choice actually gets made. Read off disk once per menu open;
-        // SaveSlotLookup is blocking, hence produceState rather than a composition-time call.
-        // ★ getGamePathSlot, NOT SaveSlotLookup.
+        // the read is blocking, hence produceState rather than a composition-time call.
+        // ★ getGamePathSlot, NOT SaveCatalog.
         //
-        // SaveSlotLookup exists for the LIBRARY, where nothing is booted and the only way to
-        // find states is to match `<serial> (title).NN.p2s` on disk. In here a VM is running, so
+        // SaveCatalog exists for the LIBRARY, where nothing is booted and the only way to
+        // find states is to match `<serial> (CRC).NN.p2s` on disk. In here a VM is running, so
         // the native side already knows the exact path for each slot — and it is authoritative
         // where the filename match is a guess that silently returns nothing when the serial is
         // absent or formatted differently, which is what made this show "Empty" for every slot.
@@ -875,8 +907,7 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     // GS Multi-threading (GV7 front/back split). Restart-required like the renderer /
     // driver above, so it lives in the same group — hit Apply & Restart below to apply.
     // Off (0) = single-threaded; on (any other value, written as 1) = GS rendering on a
-    // second thread. Description shown inline so users who never open full settings
-    // still understand what it does.
+    // second thread.
     MenuSwitchRow(
         str("renderer.gsBackThread.label"),
         settings.display.gsBackThreadMode != 0,
@@ -1141,6 +1172,34 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     MenuSwitchRow(str("fixes.syncToHostRefresh.label"), settings.display.syncToHostRefresh, field = "syncToHostRefresh") {
         viewModel.updateSettings { current -> current.copy(display = current.display.copy(syncToHostRefresh = it)) }
     }
+    // Side-by-side VR, here as well as in Settings so it can be set up against the game itself.
+    MenuSwitchRow(str("renderer.vr.label"), settings.output.vrSideBySide, field = "vrSideBySide") {
+        viewModel.updateSettings { current -> current.copy(output = current.output.copy(vrSideBySide = it)) }
+    }
+    if (settings.output.vrSideBySide) {
+        com.armsx2.ui.settings.IntSliderRow(
+            label = str("renderer.vr.size"),
+            value = settings.output.vrSize,
+            min = 30,
+            max = 100,
+            valueFormatter = { "${it}%" },
+            field = "vrSize",
+        ) { v -> viewModel.updateSettings { current -> current.copy(output = current.output.copy(vrSize = v)) } }
+        com.armsx2.ui.settings.IntSliderRow(
+            label = str("renderer.vr.distance"),
+            value = settings.output.vrDistance,
+            min = -100,
+            max = 100,
+            field = "vrDistance",
+        ) { v -> viewModel.updateSettings { current -> current.copy(output = current.output.copy(vrDistance = v)) } }
+        com.armsx2.ui.settings.IntSliderRow(
+            label = str("renderer.vr.height"),
+            value = settings.output.vrHeight,
+            min = -100,
+            max = 100,
+            field = "vrHeight",
+        ) { v -> viewModel.updateSettings { current -> current.copy(output = current.output.copy(vrHeight = v)) } }
+    }
     // RetroArch shaders, end-to-end in-game: toggle → pick a preset → download more.
     // Same composables the Settings renderer tab renders (single definition in ui/common);
     // only the save lambda differs. updateSettings routes through InGameOverlay.saveSettings,
@@ -1163,6 +1222,9 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
 @Composable
 private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMenuViewModel) {
     val settings = state.settings
+    MenuSwitchRow(str("perf.autoTune.label"), settings.emuCore.autoTune, description = str("perf.autoTune.description"), field = "autoTune") {
+        viewModel.updateSettings { current -> current.copy(emuCore = current.emuCore.copy(autoTune = it)) }
+    }
     SectionCard(str("perf.speedLimit.label"), field = "nominalSpeedPercent") {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -1264,6 +1326,12 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
     MenuSwitchRow(str("perf.hack.mtvu"), settings.cpu.mtvu, field = "mtvu") {
         viewModel.updateSettings { current -> current.copy(cpu = current.cpu.copy(mtvu = it)) }
     }
+    MenuSwitchRow(str("perf.hack.iopThread"), settings.cpu.iopThread, field = "iopThread") {
+        viewModel.updateSettings { current -> current.copy(cpu = current.cpu.copy(iopThread = it)) }
+    }
+    MenuSwitchRow(str("perf.hack.vuAot"), settings.cpu.vuAot, description = str("perf.hack.vuAot.desc"), field = "vuAot") {
+        viewModel.updateSettings { current -> current.copy(cpu = current.cpu.copy(vuAot = it)) }
+    }
     MenuSwitchRow(str("perf.hack.instantVu1"), settings.cpu.vu1Instant, field = "vu1Instant") {
         viewModel.updateSettings { current -> current.copy(cpu = current.cpu.copy(vu1Instant = it)) }
     }
@@ -1348,8 +1416,37 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
 
 @Composable
 private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuViewModel) {
-    MenuSwitchRow(str("pad.onScreenControls.label"), state.touchControlsVisible) {
-        viewModel.toggleTouchControls()
+    // The persisted on-screen controls setting itself, the same value All Settings > Controls
+    // edits, with a button for every choice. This row used to flip a temporary flag that the next
+    // screen touch undid, and after that to step through the choices one tap at a time.
+    val visibilityMode = TouchControls.visibilityMode.intValue
+    val gamepadAttached = TouchControls.gamepadConnected.value
+    SectionCard(str("pad.onScreenControls.label")) {
+        HorizontalOptionRow(
+            options = listOf(
+                TouchControls.VISIBILITY_AUTO to str("backend.renderer.auto"),
+                TouchControls.VISIBILITY_ALWAYS to str("pad.onScreenControls.always"),
+                TouchControls.VISIBILITY_OFF to str("setup.toggle.off"),
+                TouchControls.CHOICE_AUTO_HIDE to str("pad.onScreenControls.autoHide"),
+            ),
+            selected = TouchControls.visibilityChoice(),
+            keyPrefix = "onscreen",
+            onSelect = TouchControls::chooseVisibility,
+        )
+        // Auto and Auto-hide change by themselves, so say what they are doing right now.
+        // Off a handheld, Auto goes by the last button press, which no line here can state.
+        val status = when {
+            visibilityMode == TouchControls.VISIBILITY_AUTO && !TouchControls.autoFollowsGamepad -> null
+            visibilityMode == TouchControls.VISIBILITY_AUTO && gamepadAttached ->
+                str("pad.onScreenControls.nowHidden")
+            visibilityMode == TouchControls.VISIBILITY_AUTO -> str("pad.onScreenControls.nowShown")
+            visibilityMode in 1..10 -> str("pad.onScreenControls.hidesAfter").format(visibilityMode)
+            else -> null
+        }
+        if (status != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
     MenuSwitchRow(
         title = str("pad.rumble.label"),
@@ -1431,7 +1528,6 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     // Macros — edit each M1-M4 button set here in-game too (physical-trigger binding stays
     // in All Settings › Controls, which hosts the key-capture listener).
     com.armsx2.ui.settings.MacrosSection()
-    // Arcade controls for the arcade game being played: what each button does on its cabinet.
     com.armsx2.arcade.Arcade.sessionGameId.value?.let { com.armsx2.ui.settings.ArcadeControlsSection(it, pickGame = false) }
 }
 
@@ -1452,6 +1548,20 @@ private fun OptionsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
     // "▣", is one already proven to render in the shipped font -- "▩" (U+25A9) and "⏻" (U+23FB)
     // come out as tofu boxes on device.
     Spacer(Modifier.height(6.dp))
+    // Volume and Mute: the same two settings as All Settings › Audio. Both apply instantly
+    // (applyTo's direct setters).
+    com.armsx2.ui.settings.IntSliderRow(
+        label = str("audio.volume.label"),
+        value = settings.audio.audioVolume.coerceIn(0, 150),
+        min = 0,
+        max = 150,
+        valueFormatter = { "$it%" },
+        field = "audioVolume",
+        onChange = viewModel::setVolume,
+    )
+    MenuSwitchRow(str("audio.mute.label"), settings.audio.audioMuted, field = "audioMuted") {
+        viewModel.updateSettings { current -> current.copy(audio = current.audio.copy(audioMuted = it)) }
+    }
     MenuSwitchRow(str("patches.enablePatches.label"), settings.emuCore.enablePatches, field = "enablePatches") {
         viewModel.updateSettings { current -> current.copy(emuCore = current.emuCore.copy(enablePatches = it)) }
     }

@@ -19,6 +19,7 @@
 #include "GS.h"
 #include "Gif_Unit.h"
 #include "iR5900-arm64.h"
+#include "EECycleRate.h"
 #include "R5900OpcodeTables.h"
 #include "common/Perf.h"
 
@@ -27,8 +28,9 @@
 #include "EeFpuModelCall-arm64.h"
 #include "VuEfuModel.h"
 #include "VuMulBand.h"
-#include "MvuObservedEntries.h"
 #include "microVU_Persist-arm64.h"
+#include "microVU_JumpTable-arm64.h"
+#include "vuaot/VuAotMvuTrace.h"
 
 #ifndef XXH_versionNumber
 #define XXH_STATIC_LINKING_ONLY 1
@@ -171,10 +173,8 @@
 //  38 — mVUtestCycles' budget-break exit is one shared stub reached by B,
 //       carrying the block pointer and the resume PC, instead of the block
 //       pointer, a call and mVUendProgram(0) inline in every block.
-//  39 — the sign-preserving clamp's all-lane row reads qmmClampMax and
-//       qmmClampMin rather than loading the same two bounds from mVUglob, so
-//       each full-width operand clamp loses its Ldp.
-static constexpr u32 kMvuCompilerAbiVersion = 39;
+//  39+ — not recorded here; `git log -L` on the constant below lists every bump.
+static constexpr u32 kMvuCompilerAbiVersion = 65;
 
 // Hash/equality functors for XXH128_hash_t — let std::unordered_map<XXH128_hash_t, …>
 // work without a wrapping struct. low64 already carries the well-mixed half of
@@ -253,6 +253,7 @@ static_assert(sizeof(microRegInfo) == 96, "microRegInfo was not 96 bytes");
 
 struct microProgram;
 struct MvuPersistLog;
+struct VuAotProgramState;
 struct microJumpCache
 {
 	microJumpCache() : prog(NULL), x86ptrStart(NULL), hostEntry(NULL) {}
@@ -291,8 +292,38 @@ struct alignas(16) microBlock
 	u8              spinExitOnEq;
 	u8              spinViA;
 	u8              spinViB;
+	u32             extent;      // mVUBlockExtent: host and guest length, for the crash post-mortem
 };
-static_assert(sizeof(microBlock) == 224, "the spin memo rides microBlock's tail padding");
+static_assert(sizeof(microBlock) == 224, "the spin memo and the extent ride microBlock's tail padding");
+
+// How much code a block's compile produced, packed into one word so it fits
+// microBlock's padding: bits 0-19 the host bytes from x86ptrStart to where the
+// compile left the cursor, in 4-byte units (up to 4 MiB); bits 20-30 the guest
+// instruction pairs, minus one (1 to 2048). 0 means not recorded: vu-aot placed
+// the code, or the compile produced more than the field holds. Only the crash
+// post-mortem reads it (RecCrashReport-arm64.h).
+//
+// The host span includes every block compiled inside this one's compile: the
+// not-taken path of a branch is compiled in place, before the jump for the taken
+// path, so a block's span can hold other blocks whole. The innermost block whose
+// span holds a pc is the one running it.
+namespace mVUBlockExtent
+{
+	static constexpr u32 kHostUnits = 0xfffff;
+	static constexpr u32 kPairsShift = 20;
+	static constexpr u32 kPairsMask = 0x7ff;
+	static constexpr u32 kMask = 0x7fffffff; // bit 31 is free (the program cache's records use it)
+
+	static inline u32 Make(size_t host_bytes, u32 guest_pairs)
+	{
+		const size_t units = (host_bytes + 3) / 4;
+		if (units == 0 || units > kHostUnits || guest_pairs == 0 || guest_pairs > kPairsMask + 1)
+			return 0;
+		return static_cast<u32>(units) | ((guest_pairs - 1) << kPairsShift);
+	}
+	static inline u32 HostBytes(u32 extent) { return (extent & kHostUnits) * 4; }
+	static inline u32 GuestPairs(u32 extent) { return extent ? ((extent >> kPairsShift) & kPairsMask) + 1 : 0; }
+} // namespace mVUBlockExtent
 
 struct microTempRegInfo
 {
@@ -438,6 +469,7 @@ struct microRange
 };
 
 #define mProgSize (0x4000 / 4)
+static_assert(sizeof(microJumpCache) * (mProgSize / 2) == mVUJumpTable::kBytes, "mVUJumpTable::kBytes follows the jump cache");
 struct microProgram
 {
 	u32                data [mProgSize];
@@ -467,20 +499,29 @@ struct microProgram
 	// non-owning references. Single-threaded per VU, so plain s32.
 	s32           refcount;
 
-	// Set of microMem byte offsets the dispatcher has handed off into this
-	// program. Initialized at mVUcreateProg with the creator's startPC;
-	// mVUsearchProg accumulates additional entries seen during the program's
-	// lifetime. `version` lets callers detect "new entry since last compile"
-	// cheaply (compare vs the version snapshotted by the most recent
-	// SaveProgram).
-	MvuObservedEntries observed;
-
 	// Recorded block-graph snapshot (chunks + fixups) for this program, built
 	// by the emit-time recorder in microVU_Persist-arm64.inl. Null when
 	// recording is disabled or nothing was recorded. Owned here; freed via
 	// mVUPersist::OnProgramDeleted from mVUdeleteProg. (microProgram is
 	// memset-constructed in mVUcreateProg, so a raw pointer is the right shape.)
 	MvuPersistLog* persist;
+
+	// vu-aot live tier (microVU_VuAot-arm64.inl). `vuAotRuns` counts the
+	// dispatches of this program while the tier is on, `vuAotJumpRuns` the
+	// JR/JALR slow-path entries (the jump cache missed) that resolved to it;
+	// `vuaot` is the tier's state for it, null until the program is tiered up
+	// (so non-null means tiered). All stay zero with EnableVUAot off.
+	u32 vuAotRuns;
+	u32 vuAotJumpRuns;
+	VuAotProgramState* vuaot;
+	// Times a vu-aot region of this program took the budget bail: [0] at an entry from
+	// microVU, [1] at a loop head (written by the region's own bail code, which reaches
+	// the program through the bail record).
+	u64 vuAotBails[2];
+	// VU1 dispatches and VU1 cycles when the program was created or loaded (how long it waited for
+	// its first region).
+	u64 vuAotBornAt;
+	u64 vuAotBornCycle;
 };
 
 typedef std::deque<microProgram*> microProgramList;
@@ -505,6 +546,14 @@ struct microProgManager
 	u8*                x86start; // Start of rec-cache
 	u8*                x86end;   // Reset threshold — mVUcacheSafeZone MB below the physical rec-region end
 	microRegInfo       lpState;
+	// One bit per quick[] slot that holds a program: bit (i % 64) of word
+	// (i / 64) is set iff quick[i].prog != NULL. mVUclear runs on every
+	// micro-memory write and walks these bits instead of the 2048-slot array,
+	// since a game holds only a handful of programs. Set by mVUquickInstall,
+	// cleared where a slot is nulled (mVUclear, mVUreset). Any new writer of
+	// quick[].prog must keep it in step: a set slot with no bit survives every
+	// later write to its program's code.
+	u64                quickOcc[mProgSize / 2 / 64];
 };
 
 // Safe-Zone (megabytes): the gap between prog.x86end (mVUcleanUp's
@@ -696,6 +745,11 @@ struct microVU
 	// slot at compile time (XGKICK's C call, end-program emission, the
 	// divtrace per-op hook).
 	int branchCondCarryGpr;
+	// With the carry: the value is IBEQ/IBNE's raw XOR of two VIs, whose upper
+	// halves can be dirty, so the tail tests its low 16 bits (Tst #0xffff)
+	// rather than comparing the whole register with zero. Their conditions
+	// read only Z, which the two set alike for the low halfword.
+	bool branchCondCarryLow16;
 
 	// Compile-time only (never read by emitted code, so it stays out of the
 	// mVUfieldMem pin window above): set during pass 1 when this block, or a block
@@ -778,6 +832,7 @@ __fi static void mVUstrField(mV, const a64::CPURegister& reg, const void* addr)
 __fi static void mVUclearBranchCondCarry(mV)
 {
 	mVU.branchCondCarryGpr = -1;
+	mVU.branchCondCarryLow16 = false;
 }
 
 //------------------------------------------------------------------
@@ -794,6 +849,41 @@ private:
 
 public:
 	inline int getFullListCount() const { return fListI; }
+#ifdef PCSX2_RECOMPILER_TESTS
+	// Test probe (mvu_block_list_tests): the number of links a walk from the
+	// head of the full-compare list reaches, and whether fBlockEnd is the
+	// last of them.
+	int testWalkFullList(bool& endIsLast) const
+	{
+		int count = 0;
+		const microBlockLink* last = nullptr;
+		for (const microBlockLink* linkI = fBlockList; linkI != nullptr; linkI = linkI->next)
+		{
+			last = linkI;
+			count++;
+		}
+		endIsLast = (last == fBlockEnd);
+		return count;
+	}
+#endif
+	// Every block, quick list then full list, in registration order.
+	template <typename F>
+	void forEachBlock(F&& f)
+	{
+		for (microBlockLink* l = qBlockList; l; l = l->next)
+			f(l->block);
+		for (microBlockLink* l = fBlockList; l; l = l->next)
+			f(l->block);
+	}
+	// Every block in the order a search that needs no exact match tries them:
+	// registration order, both lists together (vu-aot's background jobs search
+	// a copy of the graph by the same rules).
+	template <typename F>
+	void forEachInSearchOrder(F&& f)
+	{
+		for (const microBlockLinkRef& ref : quickLookup)
+			f(*ref.pBlock);
+	}
 	microBlockManager()
 	{
 		qListI = fListI = 0;
@@ -806,14 +896,14 @@ public:
 		for (microBlockLink* linkI = qBlockList; linkI != nullptr;)
 		{
 			microBlockLink* freeI = linkI;
-			safe_delete_array(linkI->block.jumpCache);
+			mVUJumpTable::Free(linkI->block.jumpCache);
 			linkI = linkI->next;
 			_aligned_free(freeI);
 		}
 		for (microBlockLink* linkI = fBlockList; linkI != nullptr;)
 		{
 			microBlockLink* freeI = linkI;
-			safe_delete_array(linkI->block.jumpCache);
+			mVUJumpTable::Free(linkI->block.jumpCache);
 			linkI = linkI->next;
 			_aligned_free(freeI);
 		}
@@ -872,6 +962,12 @@ public:
 					if (linkI != fBlockList)
 					{
 						prevI->next = linkI->next;
+						// Moving the last link to the front leaves its
+						// predecessor last. add() appends at fBlockEnd; left
+						// pointing at the new head, it would cut off every
+						// link behind the head.
+						if (linkI == fBlockEnd)
+							fBlockEnd = prevI;
 						linkI->next = fBlockList;
 						fBlockList = linkI;
 					}
@@ -931,7 +1027,9 @@ alignas(16) extern microVU microVU1;
 extern void DumpVUState(u32 n, u32 pc);
 
 extern void mVUclear(mV, u32, u32);
-extern void mVUreset(microVU& mVU, bool resetReserve);
+// `vu1Idle`: the caller is the thread that runs VU1, between two runs, so there is no program to
+// finish first (the MTVU branch of mVUreset finishes a VU1 run in progress, for resets from the EE thread).
+extern void mVUreset(microVU& mVU, bool resetReserve, bool vu1Idle = false);
 extern void* mVUblockFetch(microVU& mVU, u32 startPC, uptr pState);
 extern void* mVUcompile(microVU& mVU, u32 startPC, uptr pState);
 _mVUt extern void* mVUcompileJIT(u32 startPC, uptr ptr);
@@ -954,6 +1052,49 @@ extern void* mVUexecuteVU1(u32 startPC, u32 cycles);
 // path.
 extern void* mVUlookupProg_VU0(u32 startPC, u32 cycles);
 extern void* mVUlookupProg_VU1(u32 startPC, u32 cycles);
+
+// vu-aot live tier (microVU_VuAot-arm64.inl). Every function here is inert
+// with EnableVUAot off: the dispatcher calls the plain lookup above, and the
+// compile hooks are never handed out.
+//   - mVUvuAotSyncConfig(): decides, from the config, whether the tier runs.
+//     Called at init and at every reset, before the dispatchers are emitted.
+//   - mVUlookupProgTier_VU1: mVUlookupProg_VU1 plus the run counter; the
+//     dispatcher calls it instead when the tier is on.
+//   - mVUvuAotAfterSearch: the slow path's chance to tier a program up.
+//   - mVUvuAotAfterJump: the same for a JR/JALR the jump cache did not know.
+//   - mVUvuAotLiveHooks: the compile hooks for a tiered-up program.
+extern void  mVUvuAotSyncConfig(microVU& mVU);
+extern bool  mVUvuAotEnabled();
+// Whether microVU0 emits the sticky tripwire's hook on VU1's STATUS quadword of its register window
+// (mVUaddrFix): the tier wanted by the config, latched at VU0's last init or reset.
+extern bool  mVUvuAotVU0WindowHook();
+extern bool  mVUvuAotPending();
+extern void* mVUlookupProgTier_VU1(u32 startPC, u32 cycles);
+extern void* mVUvuAotAfterSearch(microVU& mVU, u32 startPC, uptr pState, void* result);
+extern void* mVUvuAotAfterJump(microVU& mVU, u32 startPC, uptr pState, void* result);
+extern void  mVUvuAotLiveHooks(microVU& mVU, vuaot::VuAotRegionHook& region, void*& regionUser,
+	vuaot::VuAotBodyHook& body, void*& bodyUser);
+extern void  mVUvuAotOnProgramDeleted(microProgram& prog);
+// A program was just created, or loaded from the disk cache, for the image in micro memory (from
+// mVUsearchProg, before it is installed in a quick slot): with the program cache on, the tier reads
+// its saved plan and sends the jobs it describes to the worker.
+extern void  mVUvuAotOnProgramReady(microVU& mVU, microProgram& prog);
+// Before a reset or close frees the programs: every program whose plan changed since its sidecar was
+// written goes to the program cache's writer.
+extern void  mVUvuAotSaveAll(microVU& mVU);
+extern void  mVUvuAotOnJumpMiss(microVU& mVU);
+extern void  mVUvuAotOnBail();
+extern void  mVUvuAotOnClose(microVU& mVU);
+// The sticky-STATUS tripwire: a sticky reader microVU has just compiled (FSAND, FSEQ
+// or FSOR with `imm12`), a program being created over the micro image in memory, and VU1's run
+// entry, where the regions that dropped the sticky byte are rebuilt once the tripwire has gone off.
+extern void  mVUvuAotOnStatusReader(microVU& mVU, u32 imm12);
+extern void  mVUvuAotOnNewProgram(microVU& mVU);
+extern void  mVUvuAotRebuildIfDue();
+// The run that opens and closes a compile of VU1 code: the tier drops its
+// per-compile analysis state when the outermost one ends.
+extern void  mVUvuAotCompileBegin(microVU& mVU);
+extern void  mVUvuAotCompileEnd(microVU& mVU);
 
 // Content-hash plumbing (xxhash3-128 program identity).
 //   - mVUbuildOptionsSentinel populates mVU.optionsSentinel from the current
