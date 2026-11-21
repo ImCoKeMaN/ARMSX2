@@ -202,6 +202,11 @@ static jmethodID  s_onPadRumble_mid  = nullptr;
 static jmethodID  s_playSound_mid    = nullptr;
 static jmethodID  s_onAutoTuneCommitted_mid = nullptr;
 static jmethodID  s_onAutoTuneDisplayScale_mid = nullptr;
+// NativeApp's file helpers, which the native file system layer calls from any thread.
+static jmethodID  s_openContentUri_mid = nullptr;
+static jmethodID  s_createDirectoryPath_mid = nullptr;
+static jmethodID  s_createFilePath_mid = nullptr;
+static jmethodID  s_findSiblingChds_mid = nullptr;
 
 // The output surface's "Display Resolution (HW scaler)" as auto-tune sees it (AutoTune::DisplayScaler). Kotlin pushes
 // the setting in effect, an auto-tune trial included, and the size it shrinks from (EmulationSurface.applyOutputScale,
@@ -436,6 +441,39 @@ Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
                                                 jstring p_szbiosfolder,
                                                 jint p_apiVer) {
     redirect_stdout_to_logcat();
+
+    // Cache JavaVM + NativeApp refs for use from non-Java threads. FindClass on a thread attached
+    // from native code (the CPU thread, the IOP thread) searches only the system class loader and
+    // cannot find app classes. Done first, because the settings code below can already create files
+    // and directories through the file helpers.
+    env->GetJavaVM(&s_jvm);
+    if (jclass local = env->FindClass("kr/co/iefriends/pcsx2/NativeApp")) {
+        s_NativeApp_class = static_cast<jclass>(env->NewGlobalRef(local));
+        env->DeleteLocalRef(local);
+        s_vmSetPaused_mid = env->GetStaticMethodID(s_NativeApp_class, "vmSetPaused", "(Z)V");
+        s_onPadRumble_mid = env->GetStaticMethodID(s_NativeApp_class, "onPadRumble", "(III)V");
+        s_playSound_mid   = env->GetStaticMethodID(s_NativeApp_class, "playSound", "(Ljava/lang/String;)V");
+        s_onAutoTuneCommitted_mid = env->GetStaticMethodID(s_NativeApp_class, "onAutoTuneCommitted",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        s_onAutoTuneDisplayScale_mid = env->GetStaticMethodID(s_NativeApp_class, "onAutoTuneDisplayScale", "(I)V");
+
+        const auto bind_file_helper = [env](const char* name, const char* sig) {
+            jmethodID mid = env->GetStaticMethodID(s_NativeApp_class, name, sig);
+            if (mid == nullptr) {
+                env->ExceptionClear();
+                Console.ErrorFmt("NativeApp.{}{} not found; the file system cannot call it.", name, sig);
+            }
+            return mid;
+        };
+        s_openContentUri_mid = bind_file_helper("openContentUri", "(Ljava/lang/String;)I");
+        s_createDirectoryPath_mid = bind_file_helper("createDirectoryPath", "(Ljava/lang/String;)Z");
+        s_createFilePath_mid = bind_file_helper("createFilePath", "(Ljava/lang/String;)Z");
+        s_findSiblingChds_mid = bind_file_helper("findSiblingChds", "(Ljava/lang/String;)[Ljava/lang/String;");
+    } else {
+        env->ExceptionClear();
+        Console.Error("NativeApp class not found; callbacks and file helpers are unavailable.");
+    }
+
     // p_szpath is the user's chosen system folder (memcards, savestates,
     // configs land here) when set up via the wizard; falls back to the
     // app's externalFilesDir when unset. p_szbiosfolder is always the
@@ -630,19 +668,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
         si.Save();
 
     VMManager::Internal::LoadStartupSettings();
-
-    // Cache JavaVM + NativeApp refs for use from non-Java threads.
-    env->GetJavaVM(&s_jvm);
-    if (jclass local = env->FindClass("kr/co/iefriends/pcsx2/NativeApp")) {
-        s_NativeApp_class = static_cast<jclass>(env->NewGlobalRef(local));
-        env->DeleteLocalRef(local);
-        s_vmSetPaused_mid = env->GetStaticMethodID(s_NativeApp_class, "vmSetPaused", "(Z)V");
-        s_onPadRumble_mid = env->GetStaticMethodID(s_NativeApp_class, "onPadRumble", "(III)V");
-        s_playSound_mid   = env->GetStaticMethodID(s_NativeApp_class, "playSound", "(Ljava/lang/String;)V");
-        s_onAutoTuneCommitted_mid = env->GetStaticMethodID(s_NativeApp_class, "onAutoTuneCommitted",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
-        s_onAutoTuneDisplayScale_mid = env->GetStaticMethodID(s_NativeApp_class, "onAutoTuneDisplayScale", "(I)V");
-    }
 
     // Bind the JNI-backed HTTP downloader's class + method IDs while we
     // still have a Java-thread env. Worker threads spawned from
@@ -3825,9 +3850,12 @@ std::optional<WindowInfo> Host::AcquireRenderWindow(bool recreate_window)
     // swapchain creation, while a null handle reaches vkCreateAndroidSurfaceKHR
     // and SIGSEGVs inside the loader (RefBase::incStrong on null+4). The next
     // onNativeSurfaceChanged triggers MTGS::UpdateDisplayWindow and we
-    // re-acquire the real surface.
+    // re-acquire the real surface. pending_type says the surface will come
+    // back, so a GS device opened in this window still gets Android window
+    // support and can present on it later.
     if (!s_window) {
         _windowInfo.type = WindowInfo::Type::Surfaceless;
+        _windowInfo.pending_type = WindowInfo::Type::Android;
         return _windowInfo;
     }
 
@@ -3950,46 +3978,58 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setMaliSX2Offered(JNIEnv*, jclass, jboolean
     s_gpu_offers_malisx2.store(offered == JNI_TRUE, std::memory_order_relaxed);
 }
 
-// The "get malisx2" notice: a Mali GPU the driver list offers malisx2 for is running the Vulkan
-// hardware renderer on some other driver (Arm's own or another pack). Posted through the OSD with the
-// unsafe-settings warnings' duration, keyed so a repeat refreshes the one message. The driver is read
-// off the open Vulkan device, not from the selected pack, because a pack that fails to load falls back
-// to Arm's driver silently. So it is only known once the device is open: this runs from OnVMStarted and
-// from the game-change call that follows the game's program starting.
+// How the app names the installed malisx2 pack ("malisx2 0.4.1"), empty when none is installed. Packs
+// are installed and deleted while the app runs, so the app pushes it with the per-game driver pick
+// (applyRendererPrefs) before each boot. Read by the notice below.
+static std::mutex s_installed_malisx2_pack_mutex;
+static std::string s_installed_malisx2_pack;
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setMaliSX2InstalledPack(JNIEnv* env, jclass, jstring name) {
+    std::string pack = GetJavaString(env, name);
+    std::lock_guard<std::mutex> lock(s_installed_malisx2_pack_mutex);
+    s_installed_malisx2_pack = std::move(pack);
+}
+
+// The malisx2 notice: a Mali GPU the driver list offers malisx2 for is running the Vulkan hardware
+// renderer on some other driver (Arm's own or another pack). What it says depends on what the user
+// has (GSDriverReport::MaliSX2NoticeFor): a malisx2 pack installed but not selected, no pack
+// installed, or another pack selected. Posted through the OSD with the unsafe-settings warnings'
+// duration, keyed so a repeat refreshes the one message. A toast has no button, so the text says
+// where to switch; the driver list in Settings > Renderer has the switch itself. The driver is read
+// off the open Vulkan device, not from the selected pack, because a pack that fails to load falls
+// back to Arm's driver silently. So it is only known once the device is open: this runs from
+// OnVMStarted and from the game-change call that follows the game's program starting.
 //
-// Not shown when a malisx2 pack is selected: malisx2 needs a recent Mali kernel driver, and on an older
-// one it fails to open and the device ends up on Arm's driver, so the notice would tell the user to
-// download what they already have. The selected pack is the driver request the Vulkan library was
-// loaded with (Vulkan::GetCustomDriverStatus), which the app sets per game in applyRendererPrefs
-// before each boot.
+// Not shown when a malisx2 pack is selected: malisx2 needs a recent Mali kernel driver, and on an
+// older one it fails to open and the device ends up on Arm's driver, so the notice would tell the
+// user to get or switch to what they already have. The selected pack is the driver request the
+// Vulkan library was loaded with (Vulkan::GetCustomDriverStatus), which the app sets per game in
+// applyRendererPrefs before each boot.
 static void PostMaliSX2NoticeIfDue() {
+    using namespace GSDriverReport;
     const bool hardware = GSIsHardwareRenderer();
     const bool offered = s_gpu_offers_malisx2.load(std::memory_order_relaxed);
-    const GSDriverReport::ActiveVulkanDriver driver = GSDriverReport::GetActiveVulkanDriver();
+    const ActiveVulkanDriver driver = GetActiveVulkanDriver();
     const Vulkan::CustomDriverStatus pack = Vulkan::GetCustomDriverStatus();
-    const bool malisx2_pack_selected = pack.requested && GSDriverReport::IsMaliSX2Pack(pack.dir, pack.name);
+    const SelectedVulkanPack selected = !pack.requested ? SelectedVulkanPack::System
+        : IsMaliSX2Pack(pack.dir, pack.name) ? SelectedVulkanPack::MaliSX2 : SelectedVulkanPack::Other;
+    std::string installed_pack;
+    {
+        std::lock_guard<std::mutex> lock(s_installed_malisx2_pack_mutex);
+        installed_pack = s_installed_malisx2_pack;
+    }
 
-    if (!GSDriverReport::ShouldWarnMaliSX2(hardware, offered, driver, malisx2_pack_selected)) {
-        if (GSDriverReport::ShouldWarnMaliSX2(hardware, offered, driver, false))
+    const MaliSX2Notice notice = MaliSX2NoticeFor(hardware, offered, driver, selected, !installed_pack.empty());
+    if (notice == MaliSX2Notice::None) {
+        if (hardware && offered && driver == ActiveVulkanDriver::Other && selected == SelectedVulkanPack::MaliSX2)
             Console.WriteLn("Android: malisx2 pack selected but the Vulkan device is on another driver "
-                            "(pack failed to load?), not posting the get-malisx2 notice.");
+                            "(pack failed to load?), not posting the malisx2 notice.");
         return;
     }
     Host::AddIconOSDMessage("armsx2_mali_driver_notice", ICON_FA_CIRCLE_EXCLAMATION,
-        "Incompatible driver selected. Please download the malisx2 driver",
-        Host::OSD_WARNING_DURATION);
-}
-
-// The "get a Turnip driver" notice: the hardware renderer is on Qualcomm's own Vulkan driver, the
-// phone's built-in one or a pack of it. Same OSD, duration and timing as the malisx2 notice. Read off
-// the open device, so a Turnip pack that failed to load is warned too: the user is on Qualcomm's
-// driver either way.
-static void PostQualcommNoticeIfDue() {
-    if (!GSDriverReport::ShouldWarnQualcomm(GSIsHardwareRenderer(), GSDriverReport::GetActiveVulkanDriver()))
-        return;
-    Host::AddIconOSDMessage("armsx2_qualcomm_driver_notice", ICON_FA_CIRCLE_EXCLAMATION,
-        "Qualcomm's GPU driver is not supported. Please download a Turnip driver",
-        Host::OSD_WARNING_DURATION);
+        MaliSX2NoticeText(notice, installed_pack), Host::OSD_WARNING_DURATION);
 }
 
 void Host::OnGameChanged(const std::string& title, const std::string& elf_override, const std::string& disc_path,
@@ -4017,7 +4057,6 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
     // It is on the call when the game's own program starts.
     if (game_loaded) {
         PostMaliSX2NoticeIfDue();
-        PostQualcommNoticeIfDue();
     }
 }
 
@@ -4050,24 +4089,50 @@ static void CloseCPUThreadQueue()
         function();
 }
 
+// The calling thread's JNIEnv for a NativeApp file helper, or null. SDL attaches a thread created
+// in native code on its first call here and detaches it when the thread exits. A pending exception
+// is cleared, since no JNI call may be made with one.
+static JNIEnv* GetJavaFileEnv(jmethodID mid)
+{
+    if (s_NativeApp_class == nullptr || mid == nullptr)
+        return nullptr;
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    if (env != nullptr && env->ExceptionCheck())
+        env->ExceptionClear();
+    return env;
+}
+
+// Calls one of NativeApp's static (String) -> boolean file helpers. False on any JNI failure,
+// with no exception left pending and no local reference left behind.
+static bool CallJavaFileBooleanMethod(jmethodID mid, const char* path)
+{
+    JNIEnv* env = GetJavaFileEnv(mid);
+    if (env == nullptr)
+        return false;
+    bool ok = false;
+    jstring j_path = env->NewStringUTF(path);
+    if (j_path != nullptr)
+    {
+        ok = (env->CallStaticBooleanMethod(s_NativeApp_class, mid, j_path) == JNI_TRUE);
+        env->DeleteLocalRef(j_path);
+    }
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        ok = false;
+    }
+    return ok;
+}
+
 std::vector<std::string> FileSystem::FindContentChdSiblings(const char* filename)
 {
     std::vector<std::string> files;
-    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
-    if (!env)
+    JNIEnv* env = GetJavaFileEnv(s_findSiblingChds_mid);
+    if (env == nullptr)
         return files;
 
-    jclass native_app = env->FindClass("kr/co/iefriends/pcsx2/NativeApp");
-    if (!native_app || env->ExceptionCheck())
-    {
-        env->ExceptionClear();
-        if (native_app)
-            env->DeleteLocalRef(native_app);
-        return files;
-    }
-    jmethodID method = env->GetStaticMethodID(native_app, "findSiblingChds", "(Ljava/lang/String;)[Ljava/lang/String;");
-    jstring path = method ? env->NewStringUTF(filename) : nullptr;
-    auto siblings = path ? static_cast<jobjectArray>(env->CallStaticObjectMethod(native_app, method, path)) : nullptr;
+    jstring path = env->NewStringUTF(filename);
+    auto siblings = path ? static_cast<jobjectArray>(env->CallStaticObjectMethod(s_NativeApp_class, s_findSiblingChds_mid, path)) : nullptr;
     if (env->ExceptionCheck())
         env->ExceptionClear();
     else if (siblings)
@@ -4096,21 +4161,27 @@ std::vector<std::string> FileSystem::FindContentChdSiblings(const char* filename
         env->DeleteLocalRef(siblings);
     if (path)
         env->DeleteLocalRef(path);
-    env->DeleteLocalRef(native_app);
     return files;
 }
 
 int FileSystem::OpenFDFileContent(const char* filename)
 {
-    auto *env = static_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
-    if(env == nullptr) {
+    JNIEnv* env = GetJavaFileEnv(s_openContentUri_mid);
+    if (env == nullptr)
         return -1;
-    }
-    jclass NativeApp = env->FindClass("kr/co/iefriends/pcsx2/NativeApp");
-    jmethodID openContentUri = env->GetStaticMethodID(NativeApp, "openContentUri", "(Ljava/lang/String;)I");
 
+    int fd = -1;
     jstring j_filename = env->NewStringUTF(filename);
-    int fd = env->CallStaticIntMethod(NativeApp, openContentUri, j_filename);
+    if (j_filename != nullptr)
+    {
+        fd = env->CallStaticIntMethod(s_NativeApp_class, s_openContentUri_mid, j_filename);
+        env->DeleteLocalRef(j_filename);
+    }
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        fd = -1;
+    }
     return fd;
 }
 
@@ -4119,39 +4190,7 @@ bool FileSystem::CreateDirectoryViaJava(const char* path)
     // Bridges to NativeApp.createDirectoryPath (java.io.File.mkdirs). Used as a
     // fallback when libc mkdir() is denied on FUSE-emulated external storage,
     // which is what makes folder memory cards work on a custom data folder.
-    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
-    if (env == nullptr)
-        return false;
-    jclass NativeApp = env->FindClass("kr/co/iefriends/pcsx2/NativeApp");
-    if (NativeApp == nullptr)
-    {
-        env->ExceptionClear();
-        return false;
-    }
-    jmethodID mid = env->GetStaticMethodID(NativeApp, "createDirectoryPath", "(Ljava/lang/String;)Z");
-    if (mid == nullptr)
-    {
-        env->ExceptionClear();
-        env->DeleteLocalRef(NativeApp);
-        return false;
-    }
-    // Called many times during folder-card use, so free every local ref and clear
-    // any pending JNI exception on all paths — the Java side swallows its own, but
-    // a JNI-layer throw must not leak a local ref or an exception onto the next call.
-    bool ok = false;
-    jstring j_path = env->NewStringUTF(path);
-    if (j_path != nullptr)
-    {
-        ok = (env->CallStaticBooleanMethod(NativeApp, mid, j_path) == JNI_TRUE);
-        if (env->ExceptionCheck())
-        {
-            env->ExceptionClear();
-            ok = false;
-        }
-        env->DeleteLocalRef(j_path);
-    }
-    env->DeleteLocalRef(NativeApp);
-    return ok;
+    return CallJavaFileBooleanMethod(s_createDirectoryPath_mid, path);
 }
 
 bool FileSystem::CreateFileViaJava(const char* path)
@@ -4160,37 +4199,7 @@ bool FileSystem::CreateFileViaJava(const char* path)
     // when libc fopen(O_CREAT) is denied on FUSE-emulated external storage; once
     // the empty file exists the native truncating write that follows succeeds,
     // which is what makes NEW folder-card saves work on a custom data folder.
-    // Mirrors CreateDirectoryViaJava above; same local-ref/exception discipline.
-    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
-    if (env == nullptr)
-        return false;
-    jclass NativeApp = env->FindClass("kr/co/iefriends/pcsx2/NativeApp");
-    if (NativeApp == nullptr)
-    {
-        env->ExceptionClear();
-        return false;
-    }
-    jmethodID mid = env->GetStaticMethodID(NativeApp, "createFilePath", "(Ljava/lang/String;)Z");
-    if (mid == nullptr)
-    {
-        env->ExceptionClear();
-        env->DeleteLocalRef(NativeApp);
-        return false;
-    }
-    bool ok = false;
-    jstring j_path = env->NewStringUTF(path);
-    if (j_path != nullptr)
-    {
-        ok = (env->CallStaticBooleanMethod(NativeApp, mid, j_path) == JNI_TRUE);
-        if (env->ExceptionCheck())
-        {
-            env->ExceptionClear();
-            ok = false;
-        }
-        env->DeleteLocalRef(j_path);
-    }
-    env->DeleteLocalRef(NativeApp);
-    return ok;
+    return CallJavaFileBooleanMethod(s_createFilePath_mid, path);
 }
 
 extern "C"
@@ -5429,7 +5438,6 @@ void Host::OnVMStarted()
     // The GS device is open by now. A BIOS-only start has no game program to start, so this is
     // the only point at which that boot can get the notice.
     PostMaliSX2NoticeIfDue();
-    PostQualcommNoticeIfDue();
 }
 
 void Host::OnVMDestroyed()

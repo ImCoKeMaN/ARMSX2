@@ -50,10 +50,6 @@ struct GSMeasurementOverrides
 	/// DriverWorkaround::PreferCachedStreamRingMemory, to price that road on a device without the rule.
 	bool stream_rings_cached = false;
 
-	/// -readback-kick-passes N: in a readback frame, the Vulkan mid-frame kick waits for at least
-	/// N unsubmitted render passes (0 = the shipped spacing). Read once, when the device is created.
-	u32 readback_kick_passes = 0;
-
 	/// -alpha-bit-logic-op: take the alpha-bit logic op (GSAlphaBitLogicOp.h) on any Vulkan device
 	/// with the logicOp feature, not only where a read waits per draw. For checking its pictures
 	/// against the read on a GPU that does not need it.
@@ -76,7 +72,7 @@ struct GSMeasurementOverrides
 	/// does not on a single binary.
 	bool no_dual_source = false;
 
-	/// -runs off: the Vulkan run machine (GSRunsVK.h) is not created, so every draw takes the classic path. The
+	/// -runs off: the Vulkan run program (GSRunEmitterVK.h) is not brought up, so every row is drawn classically. The
 	/// baseline of the machine's A/Bs and of its picture checks.
 	bool runs_off = false;
 
